@@ -4,6 +4,9 @@ running-config/
 # 统计输出：由 running-config 生成，可随时重跑
 output/
 
+# ROA VRP 缓存：从 rpki.cloudflare.com 下载后过滤所得，可随时重取
+cache/
+
 # Python
 __pycache__/
 *.py[cod]

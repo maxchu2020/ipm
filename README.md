@@ -111,10 +111,17 @@ ipmlib/cleaner.py   终端分页残留清洗（退格 / 回车 / ANSI CSI 重放
 ipmlib/parsers.py   五种方言的接口地址解析 -> AddrEntry
 ipmlib/stats.py     按自有前缀汇总、按 /24 与 /48 切块 -> Report
 ipmlib/report.py    终端报表渲染
-tests/test_ipm.py   单元测试
+ipmlib/roa.py       ROA (VRP) 获取与 RFC 6811 校验
+ipmlib/irr.py       IRR (RADB) route 对象查询
+ipmlib/rov.py       ROA + IRR 合成授权判定
+ipmlib/rov_report.py 校验报表渲染
+tests/test_ipm.py   IP 统计单元测试
+tests/test_rov.py   ROA/IRR 校验单元测试（离线，不发网络请求）
 prefix.list         自有前缀（IPv4 / IPv6 混排），一行一条，支持 # 注释
+ROA-IRR.list        前缀 + 现网 origin ASN（NO = 未广播）
 running-config/     设备配置采集文件（.gitignore）
 output/             统计输出（.gitignore）
+cache/              ROA VRP 缓存（.gitignore）
 ```
 
 `running-config/` 和 `output/` 不入库：前者含明文口令哈希、SNMP community 和客户
@@ -133,3 +140,59 @@ python3 -m unittest discover -s tests
 ```
 
 环境为 Python 3.9，无第三方依赖。
+
+
+## 功能二：ROA / IRR 授权校验
+
+读 `ROA-IRR.list`（第一列前缀，第二列现网广播的 origin ASN，`NO` 表示现网未广播），
+查每条前缀的 ROA 与 IRR 登记，判定这条广播是否被授权。
+
+```bash
+./ipm.py rov                       # 完整校验（ROA + IRR）
+./ipm.py rov --no-irr              # 只做 ROA 校验，不联 whois
+./ipm.py rov --refresh-roa         # 强制重新下载 ROA 全量导出
+./ipm.py rov --csv output/rov.csv --json output/rov.json
+```
+
+### 判定口径
+
+**ROA 优先于 IRR**，与上游实际的 prefix-filter 行为一致：
+
+| 判定 | 含义 | 算 match |
+| --- | --- | --- |
+| `ROA-MATCH` | ROA 覆盖且 origin 匹配（RFC 6811 valid） | ✅ |
+| `ROA-INVALID` | 有 ROA 覆盖但没有一条匹配 | ❌ |
+| `IRR-MATCH` | 无任何 ROA 覆盖，IRR 有精确 route 且 origin 匹配 | ✅ |
+| `NO-AUTH` | 无 ROA 覆盖，IRR 也无匹配 route | ❌ |
+| `NOT-ANNOUNCED` | 现网未广播，无 origin 可比 | — |
+| `QUERY-FAILED` | IRR 查询失败，不下结论 | — |
+
+`ROA-INVALID` **不会**因为 IRR 里有登记就转为 match —— RPKI invalid 会被上游直接
+丢弃，IRR 救不回来。反过来，`QUERY-FAILED` 与 `NO-AUTH` 严格区分：查不到和查询
+失败是两回事，后者不能误报成无授权。
+
+ROA 校验严格按 RFC 6811：VRP 覆盖是 less-specific-or-equal，且必须
+`前缀长度 <= maxLength` 才算匹配。这一点在未广播的前缀上尤其重要 ——
+`218.30.0.0/15 → AS4134 maxLength 15` 覆盖了 `218.30.37.0/24` 的地址空间，
+却授权不了这条 `/24` 上线，报表里标 `✗` 并单独计数。
+
+IRR 只认**精确前缀**的 route 对象（`-T route` 会把 less-specific 覆盖对象一并
+返回，需自行过滤），origin 必须等于现网广播的 ASN。
+
+### 数据源
+
+| 数据 | 来源 | 说明 |
+| --- | --- | --- |
+| ROA (VRP) | `https://rpki.cloudflare.com/rpki.json` | rpki-client 全量导出，约 100MB |
+| IRR | `whois.radb.net:43` | RADB 及其镜像（RIPE / APNIC / ARIN / NTTCOM / LEVEL3 …） |
+
+取 ROA **全量**导出而不是逐条查在线校验 API，有两个好处：不必把「我们关心哪些
+前缀」告诉对方；89 条前缀只需一次下载。结果过滤后缓存在 `cache/vrps.json`
+（默认 12 小时内复用），首次下载约 2～3 分钟，之后秒出。
+
+**IRR 查询会把前缀逐条发给 RADB**（89 次 whois，默认间隔 0.4 秒避免触发速率
+限制）。不希望外发时用 `--no-irr`，此时只做 ROA 校验，全程离线。
+
+RADB 镜像了一个 `source: RPKI` 的伪 IRR 源（IRRd 把 ROA 自动转换成的 route
+对象），代码里已排除 —— 否则「无 ROA 覆盖但 IRR 有」会变成拿 ROA 证明 ROA 缺失
+的循环论证。
