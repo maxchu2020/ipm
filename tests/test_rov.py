@@ -22,8 +22,8 @@ def net(s):
     return ipaddress.ip_network(s)
 
 
-def vrp(prefix, asn, maxlen):
-    return Vrp(net(prefix), asn, maxlen, 0, "test")
+def vrp(prefix, asn, maxlen, expires=0, valid_to=0):
+    return Vrp(net(prefix), asn, maxlen, expires, "test", valid_to)
 
 
 class TestRoaValidation(unittest.TestCase):
@@ -213,6 +213,67 @@ class TestEvaluate(unittest.TestCase):
         self.assertEqual(len(res.roa_usable), 1)
 
 
+class TestRoaExpiry(unittest.TestCase):
+    """到期时间有两种口径，混用会得出完全相反的结论。"""
+
+    def test_cert_validto_preferred_over_chain_expiry(self):
+        # rpki.json 的 expires 是验证链有效期（几天），validTo 才是 ROA 证书有效期
+        v = vrp("10.0.0.0/24", 65000, 24, expires=1000, valid_to=9000)
+        self.assertEqual(v.expiry, 9000)
+        self.assertEqual(v.expiry_kind, roa_mod.EXPIRY_CERT)
+
+    def test_falls_back_to_chain_expiry(self):
+        v = vrp("10.0.0.0/24", 65000, 24, expires=1000)
+        self.assertEqual(v.expiry, 1000)
+        self.assertEqual(v.expiry_kind, roa_mod.EXPIRY_CHAIN)
+
+    def test_no_expiry_at_all(self):
+        self.assertIsNone(vrp("10.0.0.0/24", 65000, 24).expiry)
+
+    def test_roundtrip_through_cache_keeps_validto(self):
+        v = vrp("10.0.0.0/24", 65000, 24, expires=1000, valid_to=9000)
+        back = roa_mod._vrp_from(v.as_dict())
+        self.assertEqual(back.valid_to, 9000)
+        self.assertEqual(back.expiry, 9000)
+
+    def test_attach_validity_survives_api_failure(self):
+        """GraphQL 挂了不能让整个校验失败，退回链路有效期并标明口径。"""
+        vrps = [vrp("10.0.0.0/24", 65000, 24, expires=1000)]
+        meta = {}
+        out = roa_mod.attach_validity(vrps, [net("10.0.0.0/24")], meta,
+                                      url="http://127.0.0.1:1/none")
+        self.assertEqual(out, vrps)
+        self.assertEqual(meta["expiry_kind"], roa_mod.EXPIRY_CHAIN)
+        self.assertIn("GraphQL 不可用", meta["expiry_source"])
+
+    def test_aggregate_collapses_parents(self):
+        parents = [net("218.30.32.0/24"), net("218.30.33.0/24"),
+                   net("10.0.0.0/24")]
+        self.assertEqual([str(x) for x in roa_mod._aggregate(parents)],
+                         ["10.0.0.0/24", "218.30.32.0/23"])
+
+    def test_days_until_rounds_up(self):
+        from ipmlib.rov_report import days_until
+        # 3 天后到期必须显示「剩 3 天」，向下取整会少算一天
+        self.assertEqual(days_until(_soon(3)), 3)
+        self.assertEqual(days_until(_soon(0.5)), 1)
+        self.assertEqual(days_until(_soon(-2)), -2)
+
+    def test_expiry_warning_uses_effective_vrp(self):
+        from ipmlib.rov_report import _min_days
+        soon = vrp("10.0.0.0/24", 65000, 24, valid_to=_soon(5))
+        later = vrp("10.0.0.0/23", 65000, 24, valid_to=_soon(300))
+        rows = evaluate([(net("10.0.0.0/24"), 65000)], [soon, later], {}, {})
+        self.assertEqual(rows[0].verdict, ROA_MATCH)
+        self.assertLess(_min_days(rows[0].roa_matched), 14)
+
+
+def _soon(days):
+    import datetime
+    return int(datetime.datetime.now(datetime.timezone.utc).timestamp()
+               + days * 86400)
+
+
 class TestRovReport(unittest.TestCase):
     def test_renders_all_sections(self):
         from ipmlib.rov_report import render
@@ -220,8 +281,23 @@ class TestRovReport(unittest.TestCase):
                 (net("218.30.37.0/24"), None)]
         vrps = [vrp("218.30.33.0/24", 4134, 24), vrp("218.30.0.0/15", 4134, 15)]
         text = render(evaluate(rows, vrps, {}, {}), {"buildtime": "x"}, "whois.test")
-        for token in ("ROA / IRR 授权校验", "ROA-MATCH", "NO-AUTH", "NOT-ANNOUNCED"):
+        for token in ("ROA / IRR 授权校验", "ROA-MATCH", "NO-AUTH", "NOT-ANNOUNCED",
+                      "ROA 到期"):
             self.assertIn(token, text)
+
+    def test_expiry_warning_section_appears(self):
+        from ipmlib.rov_report import render
+        soon = vrp("10.0.0.0/24", 65000, 24, valid_to=_soon(3))
+        text = render(evaluate([(net("10.0.0.0/24"), 65000)], [soon], {}, {}),
+                      {"buildtime": "x", "expiry_kind": "cert"}, "whois.test")
+        self.assertIn("ROA 到期预警", text)
+        self.assertIn("剩3天", text)      # 向上取整，不能显示成「剩2天」
+
+    def test_chain_expiry_caveat_shown(self):
+        from ipmlib.rov_report import render
+        text = render(evaluate([(net("10.0.0.0/24"), 65000)], [], {}, {}),
+                      {"buildtime": "x", "expiry_kind": "chain"}, "whois.test")
+        self.assertIn("不代表 ROA 真的快过期", text)
 
 
 if __name__ == "__main__":

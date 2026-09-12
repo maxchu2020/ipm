@@ -7,6 +7,9 @@ output/
 # ROA VRP 缓存：从 rpki.cloudflare.com 下载后过滤所得，可随时重取
 cache/
 
+# 邮件凭证
+.env
+
 # Python
 __pycache__/
 *.py[cod]

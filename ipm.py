@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import json
 import sys
 from pathlib import Path
@@ -20,11 +21,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ipmlib import irr as irr_mod
+from ipmlib import mailer
 from ipmlib import roa as roa_mod
 from ipmlib.parsers import parse_file
 from ipmlib.report import render_text, role_of
 from ipmlib.rov import evaluate, load_list
+from ipmlib.rov_report import days_until, effective_vrps, expiry_stamp
 from ipmlib.rov_report import render as render_rov
+from ipmlib.rov_report import subject_line
 from ipmlib.stats import (block_of, build_report, load_prefixes,
                           split_prefix, unregistered_blocks)
 
@@ -178,14 +182,42 @@ def cmd_rov(args) -> int:
             progress=progress)
 
     results = evaluate(rows, vrps, irr_results, irr_errors)
-    print(render_rov(results, meta, args.whois_server))
+    report = render_rov(results, meta, args.whois_server)
+
+    attachments = []
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(report + "\n", encoding="utf-8")
+        attachments.append(args.report)
+        print(f"[ok] 报表已写入 {args.report}")
+    else:
+        # 没指定落盘位置就直接打到 stdout；定时任务用 --report 免得日志无限膨胀
+        print(report)
 
     if args.csv:
         _write_rov_csv(results, args.csv)
+        attachments.append(args.csv)
         print(f"[ok] 明细已写入 {args.csv}")
     if args.json:
         _write_rov_json(results, meta, args.json)
+        attachments.append(args.json)
         print(f"[ok] 结构化结果已写入 {args.json}")
+
+    if args.email:
+        return _send_rov_email(args, results, report, attachments)
+    return 0
+
+
+def _send_rov_email(args, results, report, attachments) -> int:
+    cfg = mailer.MailConfig(mailer.load_env(args.env))
+    subject = subject_line(results)
+    try:
+        sent = mailer.send(cfg, subject, report, attachments)
+    except Exception as exc:
+        # 邮件发不出去不该让定时任务被判定成校验失败，但必须留下明确记录
+        print(f"[error] 邮件发送失败：{exc}", file=sys.stderr)
+        return 2
+    print(f"[ok] 邮件已发送给 {len(sent)} 个地址：{subject}")
     return 0
 
 
@@ -193,8 +225,9 @@ def _write_rov_csv(results, path) -> None:
     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
         w.writerow(["prefix", "announced_origin", "roa_state", "roa_origins",
-                    "roa_covering", "irr_origins", "irr_sources", "irr_error",
-                    "verdict", "matched"])
+                    "roa_covering", "roa_expiry", "roa_expiry_days",
+                    "roa_expiry_kind", "irr_origins", "irr_sources",
+                    "irr_error", "verdict", "matched"])
         for r in results:
             w.writerow([
                 str(r.prefix),
@@ -203,12 +236,28 @@ def _write_rov_csv(results, path) -> None:
                 " ".join(f"AS{a}" for a in r.roa_origins),
                 " ".join(f"{v.network}@AS{v.asn}(<={v.max_length})"
                          for v in r.roa_covering),
+                _expiry_date(r), _expiry_days(r), _expiry_kind(r),
                 " ".join(f"AS{a}" for a in r.irr_origins),
                 " ".join(sorted({x.source for x in r.irr_routes})),
                 r.irr_error,
                 r.verdict,
                 "Y" if r.matched else "N",
             ])
+
+
+def _expiry_date(r) -> str:
+    ts = expiry_stamp(r)
+    return datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
+
+
+def _expiry_days(r):
+    ts = expiry_stamp(r)
+    return days_until(ts) if ts is not None else ""
+
+
+def _expiry_kind(r) -> str:
+    vrps = [v for v in effective_vrps(r) if v.expiry]
+    return vrps[0].expiry_kind if vrps else ""
 
 
 def _write_rov_json(results, meta, path) -> None:
@@ -221,6 +270,10 @@ def _write_rov_json(results, meta, path) -> None:
             "roa_state": r.roa_state,
             "roa_covering": [v.as_dict() for v in r.roa_covering],
             "roa_matched": [v.as_dict() for v in r.roa_matched],
+            "roa_usable": [v.as_dict() for v in r.roa_usable],
+            "roa_expiry": _expiry_date(r),
+            "roa_expiry_days": _expiry_days(r),
+            "roa_expiry_kind": _expiry_kind(r),
             "irr_routes": [{"prefix": str(x.network), "origin": x.origin,
                             "source": x.source, "descr": x.descr,
                             "mnt_by": x.mnt_by} for x in r.irr_routes],
@@ -272,8 +325,14 @@ def main(argv=None) -> int:
                    help="IRR 查询间隔秒数，避免触发速率限制（默认 0.4）")
     r.add_argument("--no-irr", action="store_true",
                    help="跳过 IRR 查询，只做 ROA 校验（离线可用）")
+    r.add_argument("--report", type=Path,
+                   help="把报表写入文件而不是打印到 stdout（定时任务用，避免日志膨胀）")
     r.add_argument("--csv", type=Path, help="把逐条结果另存为 CSV")
     r.add_argument("--json", type=Path, help="把结果另存为 JSON")
+    r.add_argument("--email", action="store_true",
+                   help="把报表通过邮件推送（收件人等配置读 .env）")
+    r.add_argument("--env", type=Path, default=BASE / ".env",
+                   help="邮件配置文件（默认 ./.env）")
     r.set_defaults(func=cmd_rov)
 
     args = ap.parse_args(argv)

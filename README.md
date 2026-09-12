@@ -115,13 +115,16 @@ ipmlib/roa.py       ROA (VRP) 获取与 RFC 6811 校验
 ipmlib/irr.py       IRR (RADB) route 对象查询
 ipmlib/rov.py       ROA + IRR 合成授权判定
 ipmlib/rov_report.py 校验报表渲染
+ipmlib/mailer.py    SMTP 推送
 tests/test_ipm.py   IP 统计单元测试
 tests/test_rov.py   ROA/IRR 校验单元测试（离线，不发网络请求）
+tests/test_mailer.py 邮件推送单元测试（离线，不连 SMTP）
 prefix.list         自有前缀（IPv4 / IPv6 混排），一行一条，支持 # 注释
 ROA-IRR.list        前缀 + 现网 origin ASN（NO = 未广播）
 running-config/     设备配置采集文件（.gitignore）
 output/             统计输出（.gitignore）
 cache/              ROA VRP 缓存（.gitignore）
+.env                邮件凭证（.gitignore，600 权限）
 ```
 
 `running-config/` 和 `output/` 不入库：前者含明文口令哈希、SNMP community 和客户
@@ -184,7 +187,21 @@ IRR 只认**精确前缀**的 route 对象（`-T route` 会把 less-specific 覆
 | 数据 | 来源 | 说明 |
 | --- | --- | --- |
 | ROA (VRP) | `https://rpki.cloudflare.com/rpki.json` | rpki-client 全量导出，约 100MB |
+| ROA 到期 | `https://rpki.cloudflare.com/api/graphql` | ROA 证书的 `validTo` |
 | IRR | `whois.radb.net:43` | RADB 及其镜像（RIPE / APNIC / ARIN / NTTCOM / LEVEL3 …） |
+
+### ROA 到期时间的两种口径
+
+**不能拿 `rpki.json` 里的 `expires` 当 ROA 到期日。** 那是整条验证链的有效期，
+受 manifest/CRL 约束（通常每天重签），永远只剩几天 —— 当前数据里 130 条 VRP
+全部显示 0.6~5.6 天到期，据此会得出「全网 ROA 即将过期」的错误结论。
+
+真正的 ROA 证书有效期来自 Cloudflare GraphQL 接口的 `validTo`（与其网页版
+Route Validator 同源），同一批 VRP 实际是 40~355 天。报表用 `validTo`，
+接口不可用时才退回链路有效期，**并在表头明确标注当次用的是哪种口径**。
+
+剩余天数向上取整：3 天后到期显示「剩 3 天」，向下取整会系统性少算一天。
+30 天内到期会单独列出预警段；未触发时总体结果里仍给出到期分布。
 
 取 ROA **全量**导出而不是逐条查在线校验 API，有两个好处：不必把「我们关心哪些
 前缀」告诉对方；89 条前缀只需一次下载。结果过滤后缓存在 `cache/vrps.json`
@@ -196,3 +213,51 @@ IRR 只认**精确前缀**的 route 对象（`-T route` 会把 less-specific 覆
 RADB 镜像了一个 `source: RPKI` 的伪 IRR 源（IRRd 把 ROA 自动转换成的 route
 对象），代码里已排除 —— 否则「无 ROA 覆盖但 IRR 有」会变成拿 ROA 证明 ROA 缺失
 的循环论证。
+
+
+### 定时运行与邮件推送
+
+每天 **07:00 / 19:00** 各跑一次，结果邮件推送（错开 `radb-query.timer` 的
+03:00/15:00，避免同一时刻集中访问 rpki.cloudflare.com 与 whois.radb.net）。
+
+```
+/etc/systemd/system/ipm-rov.timer     每日两次触发
+/etc/systemd/system/ipm-rov.service   oneshot，跑 ipm.py rov --email
+/etc/logrotate.d/ipm-rov              轮转 output/rov-cron.log，周切 8 份
+```
+
+```bash
+systemctl list-timers ipm-rov.timer   # 看下次执行时间
+systemctl start ipm-rov.service       # 立刻手动跑一次（会真的发信）
+journalctl -u ipm-rov -n 50           # 看执行记录
+tail -f /opt/project/ipm/output/rov-cron.log
+```
+
+邮件标题直接带结论，不展开附件也知道要不要处理：
+
+| 情况 | 标题 |
+| --- | --- |
+| 正常 | `[ipm] ROA/IRR 校验 正常 — 已广播 32/32 条授权有效` |
+| 有问题 | `[ipm] ROA/IRR 校验 ⚠ 2 条无授权，1 条 ROA 将到期` |
+
+正文是等宽排版的完整报表（HTML 用 `<pre>` 保持对齐），附件为
+`rov-report.txt` / `rov.csv` / `rov.json`。
+
+定时任务用 `--report` 把报表写进文件而不是打到 stdout —— 否则每次执行都会把
+一百多行报表追加进日志，一年下来十几 MB。
+
+#### 邮件配置
+
+凭证放 `.env`（`600` 权限，已在 `.gitignore` 里），格式见 `.env.example`：
+
+```env
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+SENDER_EMAIL=your-account@gmail.com
+SENDER_PASSWORD=xxxx xxxx xxxx xxxx   # Gmail 应用专用密码，不是账号密码
+RECIPIENT_EMAILS=someone@example.com,another@example.com
+BCC_EMAILS=
+```
+
+密送地址只进投递列表、不写进信头 —— 写进去就不是密送了（有测试锁住这一点）。
+邮件发送失败时退出码为 `2` 且日志留有明确记录，但不会把校验结果本身判成失败。
