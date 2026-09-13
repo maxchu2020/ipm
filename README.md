@@ -153,7 +153,7 @@ python3 -m unittest discover -s tests
 ```bash
 ./ipm.py rov                       # 完整校验（ROA + IRR）
 ./ipm.py rov --no-irr              # 只做 ROA 校验，不联 whois
-./ipm.py rov --refresh-roa         # 强制重新下载 ROA 全量导出
+./ipm.py rov --roa-max-age 60      # 调试时允许复用 60 分钟内的 ROA 缓存
 ./ipm.py rov --csv output/rov.csv --json output/rov.json
 ```
 
@@ -204,8 +204,17 @@ Route Validator 同源），同一批 VRP 实际是 40~355 天。报表用 `vali
 30 天内到期会单独列出预警段；未触发时总体结果里仍给出到期分布。
 
 取 ROA **全量**导出而不是逐条查在线校验 API，有两个好处：不必把「我们关心哪些
-前缀」告诉对方；89 条前缀只需一次下载。结果过滤后缓存在 `cache/vrps.json`
-（默认 12 小时内复用），首次下载约 2～3 分钟，之后秒出。
+前缀」告诉对方；89 条前缀只需一次下载。
+
+**每次校验都重新下载，默认不复用缓存**（`--roa-max-age 0`）。校验的意义就在于
+反映当下的 RPKI 状态，拿几小时前的快照去判 valid/invalid 可能得出与现网相反的
+结论 —— 一条刚过期或刚修好的 ROA 在旧快照里是看不出来的。Cloudflare 约每 20
+分钟重建一次 dump，重下一次约 2～3 分钟，对每日两次的任务完全可接受。
+
+调试时可以用 `--roa-max-age 60` 之类放宽，此时报表头会明确标出
+「⚠ 复用了 N 分钟前的本地缓存」。报表同时给出 dump 自身的构建时间与距今多久，
+数据源本身超过 2 小时没更新会标「⚠ 数据源偏旧」—— 那是 Cloudflare 侧的问题，
+不是我们缓存旧。
 
 **IRR 查询会把前缀逐条发给 RADB**（89 次 whois，默认间隔 0.4 秒避免触发速率
 限制）。不希望外发时用 `--no-irr`，此时只做 ROA 校验，全程离线。

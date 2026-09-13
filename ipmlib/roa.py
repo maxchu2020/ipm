@@ -14,6 +14,7 @@ VRP 来自 Cloudflare 的 rpki.json 全量导出（rpki-client 生成）。取�
 
 from __future__ import annotations
 
+import datetime as _dt
 import gzip
 import ipaddress
 import json
@@ -24,7 +25,12 @@ from pathlib import Path
 
 ROA_DUMP_URL = "https://rpki.cloudflare.com/rpki.json"
 ROA_API_URL = "https://rpki.cloudflare.com/api/graphql"
-CACHE_MAX_AGE = 12 * 3600          # 缓存超过 12 小时就重新拉取
+# 默认不复用缓存：校验的意义就在于反映当下的 RPKI 状态，
+# 拿几小时前的快照去判 valid/invalid 可能得出与现网相反的结论。
+# Cloudflare 约每 20 分钟重建一次 dump，重下的代价是可接受的。
+CACHE_MAX_AGE = 0
+# dump 自身的构建时间超过这个值就提示数据源偏旧（不是我们缓存旧）
+STALE_BUILDTIME = 2 * 3600
 CACHE_SCHEMA = 2                   # 缓存结构变了就作废重取
 
 # 到期时间的两种来源，含义完全不同，报表必须标明用的是哪一种
@@ -80,17 +86,19 @@ def _relevant(net, parents) -> bool:
 
 def fetch_vrps(parents, cache_path, url: str = ROA_DUMP_URL,
                max_age: int = CACHE_MAX_AGE, refresh: bool = False):
-    """取回与 parents 有交集的 VRP；优先用缓存。
+    """取回与 parents 有交集的 VRP。
 
-    返回 (vrps, meta)，meta 含数据构建时间与来源，报表要如实标出数据新鲜度。
+    max_age 为 0（默认）时每次都重新下载；只有显式放宽 max_age 才会复用缓存。
+    返回 (vrps, meta)，meta 含数据构建时间与取得时间，报表要如实标出新鲜度。
     """
     cache_path = Path(cache_path)
-    if not refresh and cache_path.is_file():
+    if not refresh and max_age > 0 and cache_path.is_file():
         age = time.time() - cache_path.stat().st_mtime
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
         if age < max_age and cached.get("meta", {}).get("schema") == CACHE_SCHEMA:
             meta = cached["meta"]
             meta["cache_age_sec"] = int(age)
+            meta["from_cache"] = True
             return [_vrp_from(d) for d in cached["vrps"]], meta
 
     vrps, meta = _download(url, parents)
@@ -101,7 +109,21 @@ def fetch_vrps(parents, cache_path, url: str = ROA_DUMP_URL,
         {"meta": meta, "vrps": [v.as_dict() for v in vrps]},
         indent=1), encoding="utf-8")
     meta["cache_age_sec"] = 0
+    meta["from_cache"] = False
     return vrps, meta
+
+
+def buildtime_age(meta):
+    """dump 自身构建至今多少秒；解析不出来返回 None。"""
+    stamp = meta.get("buildtime")
+    if not stamp:
+        return None
+    try:
+        built = _dt.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=_dt.timezone.utc)
+    except ValueError:
+        return None
+    return (_dt.datetime.now(_dt.timezone.utc) - built).total_seconds()
 
 
 def _vrp_from(d: dict) -> Vrp:

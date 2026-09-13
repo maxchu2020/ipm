@@ -159,9 +159,10 @@ def _entry_json(e):
 def cmd_rov(args) -> int:
     rows = load_list(args.list)
     prefixes = [net for net, _ in rows]
-    print(f"[1/2] 取 ROA 数据（{len(prefixes)} 条前缀）…", file=sys.stderr)
+    how = "复用缓存" if args.roa_max_age else "重新下载"
+    print(f"[1/2] 取 ROA 数据（{len(prefixes)} 条前缀，{how}）…", file=sys.stderr)
     vrps, meta = roa_mod.fetch_vrps(prefixes, args.roa_cache,
-                                    refresh=args.refresh_roa)
+                                    max_age=args.roa_max_age * 60)
     meta["relevant_vrps"] = len(vrps)
 
     if args.no_irr:
@@ -317,8 +318,9 @@ def main(argv=None) -> int:
                    help="前缀表：第一列前缀，第二列现网 origin ASN（NO=未广播）")
     r.add_argument("--roa-cache", type=Path, default=BASE / "cache/vrps.json",
                    help="ROA VRP 缓存文件（默认 ./cache/vrps.json）")
-    r.add_argument("--refresh-roa", action="store_true",
-                   help="强制重新下载 ROA 全量导出（约 100MB，需数分钟）")
+    r.add_argument("--roa-max-age", type=int, default=0, metavar="MIN",
+                   help="ROA 缓存可复用的分钟数；默认 0 表示每次都重新下载"
+                        "（约 100MB，需数分钟）。调试时可设大以复用缓存")
     r.add_argument("--whois-server", default=irr_mod.WHOIS_SERVER,
                    help=f"IRR whois 服务器（默认 {irr_mod.WHOIS_SERVER}）")
     r.add_argument("--irr-delay", type=float, default=0.4, metavar="SEC",

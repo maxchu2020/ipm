@@ -121,9 +121,7 @@ def render(results, roa_meta, irr_server: str, width: int = 128) -> str:
     matched = [r for r in announced if r.matched]
 
     built = roa_meta.get("buildtime", "?")
-    age = roa_meta.get("cache_age_sec")
-    cache_note = ("刚下载" if not age else
-                  f"本地缓存 {age // 60} 分钟前取得")
+    cache_note = _freshness(roa_meta)
 
     out = ["=" * width,
            "ROA / IRR 授权校验",
@@ -131,7 +129,7 @@ def render(results, roa_meta, irr_server: str, width: int = 128) -> str:
            f"前缀总数  {len(results)} 条（已广播 {len(announced)}，"
            f"未广播 {len(results) - len(announced)}）",
            f"ROA 数据  {roa_meta.get('source', '?')}",
-           f"          构建于 {built}，{cache_note}；"
+           f"          数据构建于 {built}（{cache_note}）；"
            f"命中相关 VRP {roa_meta.get('relevant_vrps', '?')} 条"
            f"（全量 {roa_meta.get('total_vrps', '?')} 条）",
            f"ROA 到期  {roa_meta.get('expiry_source', '?')}",
@@ -274,3 +272,26 @@ def subject_line(results, prefix: str = "[ipm] ROA/IRR 校验") -> str:
         return f"{prefix} ⚠ " + "，".join(alerts)
     matched = sum(1 for r in announced if r.matched)
     return f"{prefix} 正常 — 已广播 {matched}/{len(announced)} 条授权有效"
+
+
+def _freshness(roa_meta) -> str:
+    """说清楚数据有多新——是刚下的还是复用了旧缓存，以及数据源本身有多旧。"""
+    from .roa import STALE_BUILDTIME, buildtime_age
+
+    parts = []
+    age = buildtime_age(roa_meta)
+    if age is None:
+        parts.append("构建时间未知")
+    else:
+        mins = int(age // 60)
+        parts.append(f"{mins} 分钟前" if mins < 180
+                     else f"{mins // 60} 小时前")
+        if age > STALE_BUILDTIME:
+            parts.append("⚠ 数据源偏旧")
+
+    if roa_meta.get("from_cache"):
+        cached = roa_meta.get("cache_age_sec") or 0
+        parts.append(f"⚠ 复用了 {cached // 60} 分钟前的本地缓存")
+    else:
+        parts.append("本次重新下载")
+    return "，".join(parts)

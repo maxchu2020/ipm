@@ -274,6 +274,83 @@ def _soon(days):
                + days * 86400)
 
 
+class TestFreshness(unittest.TestCase):
+    """校验必须基于当下的 RPKI 状态，数据新鲜度要能被看见。"""
+
+    def test_default_never_reuses_cache(self):
+        # 拿几小时前的快照判 valid/invalid 可能与现网相反，默认必须重新下载
+        self.assertEqual(roa_mod.CACHE_MAX_AGE, 0)
+
+    def test_cache_skipped_when_max_age_zero(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / "vrps.json"
+            cache.write_text(_json.dumps(
+                {"meta": {"schema": roa_mod.CACHE_SCHEMA}, "vrps": []}),
+                encoding="utf-8")
+            calls = []
+            orig = roa_mod._download
+            roa_mod._download = lambda url, parents: (calls.append(1), ([], {}))[1]
+            try:
+                roa_mod.fetch_vrps([net("10.0.0.0/24")], cache, max_age=0)
+            finally:
+                roa_mod._download = orig
+            self.assertEqual(len(calls), 1, "max_age=0 时不该走缓存")
+
+    def test_cache_used_when_explicitly_allowed(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / "vrps.json"
+            cache.write_text(_json.dumps(
+                {"meta": {"schema": roa_mod.CACHE_SCHEMA, "buildtime": "x"},
+                 "vrps": []}), encoding="utf-8")
+            calls = []
+            orig = roa_mod._download
+            roa_mod._download = lambda url, parents: (calls.append(1), ([], {}))[1]
+            try:
+                _, meta = roa_mod.fetch_vrps([net("10.0.0.0/24")], cache,
+                                             max_age=3600)
+            finally:
+                roa_mod._download = orig
+            self.assertEqual(calls, [])
+            self.assertTrue(meta["from_cache"])
+
+    def test_buildtime_age_parsed(self):
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stamp = (now - datetime.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertAlmostEqual(roa_mod.buildtime_age({"buildtime": stamp}),
+                               3 * 3600, delta=120)
+        self.assertIsNone(roa_mod.buildtime_age({}))
+        self.assertIsNone(roa_mod.buildtime_age({"buildtime": "garbage"}))
+
+    def test_report_flags_reused_cache(self):
+        from ipmlib.rov_report import render
+        text = render([], {"buildtime": "2026-09-12T01:27:57Z",
+                           "from_cache": True, "cache_age_sec": 563 * 60},
+                      "whois.test")
+        self.assertIn("复用了 563 分钟前的本地缓存", text)
+        self.assertIn("⚠", text)
+
+    def test_report_flags_stale_source(self):
+        from ipmlib.rov_report import render
+        text = render([], {"buildtime": "2020-01-01T00:00:00Z",
+                           "from_cache": False}, "whois.test")
+        self.assertIn("数据源偏旧", text)
+
+    def test_report_says_freshly_downloaded(self):
+        import datetime
+        from ipmlib.rov_report import render
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stamp = (now - datetime.timedelta(minutes=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        text = render([], {"buildtime": stamp, "from_cache": False}, "whois.test")
+        self.assertIn("本次重新下载", text)
+        self.assertIn("12 分钟前", text)
+        self.assertNotIn("数据源偏旧", text)
+
+
 class TestRovReport(unittest.TestCase):
     def test_renders_all_sections(self):
         from ipmlib.rov_report import render
