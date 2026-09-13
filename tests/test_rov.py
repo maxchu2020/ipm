@@ -362,13 +362,58 @@ class TestRovReport(unittest.TestCase):
                       "ROA 到期"):
             self.assertIn(token, text)
 
-    def test_expiry_warning_section_appears(self):
+    def _render(self, *pairs):
+        """pairs: (前缀, 剩余天数) —— 构造一份只含到期信息的报表。"""
         from ipmlib.rov_report import render
-        soon = vrp("10.0.0.0/24", 65000, 24, valid_to=_soon(3))
-        text = render(evaluate([(net("10.0.0.0/24"), 65000)], [soon], {}, {}),
+        vrps = [vrp(p, 65000, int(p.split("/")[1]), valid_to=_soon(d))
+                for p, d in pairs]
+        rows = [(net(p), 65000) for p, _ in pairs]
+        return render(evaluate(rows, vrps, {}, {}),
                       {"buildtime": "x", "expiry_kind": "cert"}, "whois.test")
-        self.assertIn("ROA 到期预警", text)
+
+    def test_expiry_warning_section_appears(self):
+        text = self._render(("10.0.0.0/24", 3))
         self.assertIn("剩3天", text)      # 向上取整，不能显示成「剩2天」
+
+    def test_critical_block_comes_before_summary(self):
+        """14 天内的必须单独成块，且排在总体结果前面。"""
+        text = self._render(("10.0.0.0/24", 5), ("10.0.1.0/24", 200))
+        self.assertIn("紧急", text)
+        self.assertLess(text.index("紧急"), text.index("一、总体结果"))
+        self.assertIn("10.0.0.0/24", text.split("一、总体结果")[0])
+
+    def test_critical_and_warn_tiers_separated(self):
+        text = self._render(("10.0.0.0/24", 5), ("10.0.1.0/24", 22))
+        head, rest = text.split("ROA 到期预警（14~30 天）")
+        self.assertIn("10.0.0.0/24", head)      # 5 天 -> 紧急块
+        self.assertNotIn("10.0.1.0/24", head)   # 22 天 -> 次级预警
+        self.assertIn("10.0.1.0/24", rest)
+
+    def test_expired_counted_and_labelled(self):
+        text = self._render(("10.0.0.0/24", -3))
+        self.assertIn("已过期", text)
+        self.assertIn("其中 1 条已过期", text)
+        self.assertIn("已过期 3 天", text)      # 不能写成「-3 天后到期」
+
+    def test_no_alert_block_when_all_far_out(self):
+        text = self._render(("10.0.0.0/24", 200))
+        self.assertNotIn("紧急", text)
+        self.assertNotIn("ROA 到期预警", text)
+
+    def test_subject_calls_out_critical_tier(self):
+        from ipmlib.rov_report import subject_line
+        vrps = [vrp("10.0.0.0/24", 65000, 24, valid_to=_soon(5)),
+                vrp("10.0.1.0/24", 65000, 24, valid_to=_soon(22))]
+        rows = [(net("10.0.0.0/24"), 65000), (net("10.0.1.0/24"), 65000)]
+        subj = subject_line(evaluate(rows, vrps, {}, {}))
+        self.assertIn("1 条 ROA 14 天内到期", subj)
+        self.assertIn("1 条 ROA 30 天内到期", subj)
+
+    def test_subject_says_expired_when_all_critical_are_expired(self):
+        from ipmlib.rov_report import subject_line
+        vrps = [vrp("10.0.0.0/24", 65000, 24, valid_to=_soon(-1))]
+        subj = subject_line(evaluate([(net("10.0.0.0/24"), 65000)], vrps, {}, {}))
+        self.assertIn("已过期", subj)
 
     def test_chain_expiry_caveat_shown(self):
         from ipmlib.rov_report import render

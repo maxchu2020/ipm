@@ -211,43 +211,78 @@ def _expiry_overview(results) -> list:
         return []
     days.sort()
     buckets = [("已过期", lambda d: d < 0),
-               ("30 天内", lambda d: 0 <= d < 30),
-               ("30-90 天", lambda d: 30 <= d < 90),
+               (f"{EXPIRY_CRITICAL} 天内", lambda d: 0 <= d < EXPIRY_CRITICAL),
+               (f"{EXPIRY_CRITICAL}-{EXPIRY_WARN} 天",
+                lambda d: EXPIRY_CRITICAL <= d < EXPIRY_WARN),
+               ("30-90 天", lambda d: EXPIRY_WARN <= d < 90),
                ("90-180 天", lambda d: 90 <= d < 180),
                ("180 天以上", lambda d: d >= 180)]
     parts = [f"{name} {sum(1 for d in days if pred(d))} 条"
              for name, pred in buckets if any(pred(d) for d in days)]
+    first = min(days)
+    soonest = f"已过期 {-first} 天" if first < 0 else f"{first} 天后"
     return ["", f"  ROA 到期分布（{len(days)} 条有 ROA 覆盖）：" + "，".join(parts),
-            f"  最早到期 {min(days)} 天后，中位 {days[len(days) // 2]} 天"]
+            f"  最早到期：{soonest}；中位 {days[len(days) // 2]} 天"]
+
+
+def _expiry_rows(results, lo, hi) -> list:
+    """剩余天数落在 [lo, hi) 区间的前缀，按最紧急的排前面。"""
+    rows = []
+    for r in results:
+        days = _min_days(effective_vrps(r))
+        if days is not None and lo <= days < hi:
+            rows.append((days, r))
+    rows.sort(key=lambda x: (x[0], str(x[1].prefix)))
+    return rows
+
+
+def _expiry_table(rows) -> list:
+    out = ["  " + _pad("前缀", 22) + _pad("origin", 12) + _pad("剩余", 12)
+           + _pad("到期日", 14) + "ROA",
+           "  " + "-" * 100]
+    for days, r in rows:
+        vrps = effective_vrps(r)
+        stamp = min(v.expiry for v in vrps if v.expiry)
+        left = "已过期" if days < 0 else f"{days} 天"
+        out.append("  " + _pad(_trunc(str(r.prefix), 22), 22)
+                   + _pad(f"AS{r.origin}" if r.announced else "未广播", 12)
+                   + _pad(left, 12)
+                   + _pad(_dt.datetime.utcfromtimestamp(stamp).strftime("%Y-%m-%d"), 14)
+                   + "、".join(_vrp_label(v, r.prefix) for v in vrps))
+    return out
 
 
 def _expiry_section(results, width: int) -> list:
-    """ROA 到期预警：过期或临近到期的 ROA 会让广播从 valid 掉成 invalid。"""
-    rows = []
-    for r in results:
-        vrps = r.roa_matched or r.roa_usable
-        days = _min_days(vrps)
-        if days is not None and days < EXPIRY_WARN:
-            rows.append((days, r))
-    if not rows:
-        return []
+    """ROA 到期提醒，分两档。
 
-    rows.sort(key=lambda x: x[0])
-    out = [_rule("⚠ ROA 到期预警", width),
-           f"  {len(rows)} 条前缀依赖的 ROA 将在 {EXPIRY_WARN} 天内到期。"
-           "ROA 过期后该广播会从 valid 掉成 invalid，被上游丢弃。",
-           "  " + _pad("前缀", 20) + _pad("origin", 12) + _pad("剩余", 10)
-           + _pad("到期日", 14) + "ROA",
-           "  " + "-" * 96]
-    for days, r in rows:
-        vrps = r.roa_matched or r.roa_usable
-        stamp = min(v.expiry for v in vrps if v.expiry)
-        out.append("  " + _pad(str(r.prefix), 20)
-                   + _pad(f"AS{r.origin}" if r.announced else "未广播", 12)
-                   + _pad(f"{days} 天" if days >= 0 else "已过期", 10)
-                   + _pad(_dt.datetime.utcfromtimestamp(stamp).strftime("%Y-%m-%d"), 14)
-                   + "、".join(_vrp_label(v, r.prefix) for v in vrps))
-    out.append("")
+    14 天内（含已过期）单独成块放在报表最前面：这一档留给运维的反应时间已经
+    很短，ROA 一旦过期，对应广播会从 valid 掉成 invalid 被上游丢弃。
+    15~30 天的作为次级预警跟在后面，供排续签计划。
+    """
+    critical = _expiry_rows(results, -10 ** 6, EXPIRY_CRITICAL)
+    warn = _expiry_rows(results, EXPIRY_CRITICAL, EXPIRY_WARN)
+
+    out = []
+    if critical:
+        expired = sum(1 for d, _ in critical if d < 0)
+        head = f"{len(critical)} 条"
+        if expired:
+            head += f"（其中 {expired} 条已过期）"
+        out += ["!" * width,
+                f"!! 紧急：{head}前缀的 ROA 将在 {EXPIRY_CRITICAL} 天内到期",
+                f"!! ROA 过期后该广播立即从 valid 变 invalid，会被上游丢弃 —— 请尽快续签",
+                "!" * width,
+                ""]
+        out += _expiry_table(critical)
+        out.append("")
+
+    if warn:
+        out.append(_rule(f"⚠ ROA 到期预警（{EXPIRY_CRITICAL}~{EXPIRY_WARN} 天）",
+                         width))
+        out.append(f"  {len(warn)} 条前缀的 ROA 将在 {EXPIRY_WARN} 天内到期，"
+                   "建议排进续签计划。")
+        out += _expiry_table(warn)
+        out.append("")
     return out
 
 
@@ -256,15 +291,18 @@ def subject_line(results, prefix: str = "[ipm] ROA/IRR 校验") -> str:
     announced = [r for r in results if r.announced]
     bad = [r for r in results if r.verdict in (ROA_INVALID, NO_AUTH)]
     failed = [r for r in results if r.verdict == QUERY_FAILED]
-    expiring = [r for r in results
-                if (_min_days(effective_vrps(r)) or 999) < EXPIRY_WARN
-                and r.announced]
+    critical = _expiry_rows(results, -10 ** 6, EXPIRY_CRITICAL)
+    warn = _expiry_rows(results, EXPIRY_CRITICAL, EXPIRY_WARN)
 
     alerts = []
+    if critical:
+        expired = sum(1 for d, _ in critical if d < 0)
+        alerts.append(f"{expired} 条 ROA 已过期" if expired == len(critical)
+                      else f"{len(critical)} 条 ROA {EXPIRY_CRITICAL} 天内到期")
     if bad:
         alerts.append(f"{len(bad)} 条无授权")
-    if expiring:
-        alerts.append(f"{len(expiring)} 条 ROA 将到期")
+    if warn:
+        alerts.append(f"{len(warn)} 条 ROA {EXPIRY_WARN} 天内到期")
     if failed:
         alerts.append(f"{len(failed)} 条查询失败")
 

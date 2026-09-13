@@ -139,8 +139,9 @@ class TestSubjectLine(unittest.TestCase):
         self.assertIn("⚠", bad)
         self.assertIn("无授权", bad)
 
+        # 到期提醒分两档，标题要点明是哪一档
         exp = subject_line(evaluate([(n("10.0.0.0/24"), 65000)], [soon], {}, {}))
-        self.assertIn("将到期", exp)
+        self.assertIn("14 天内到期", exp)
 
 
 if __name__ == "__main__":
