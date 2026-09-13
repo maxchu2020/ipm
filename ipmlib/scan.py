@@ -1,7 +1,7 @@
-"""对自有 IPv4 前缀做存活扫描，按 /24 汇总。
+"""对自有 IPv4 前缀做在用地址扫描，按 /24 汇总。
 
 用 nmap 做主机发现（`-sn`），探测方式是 ICMP + TCP SYN/ACK：
-实测同一条 /20 里纯 ICMP 只发现 50 个存活，加上 TCP 80/443/22 探测后是 95 个 ——
+实测同一条 /20 里纯 ICMP 只发现 50 个在用，加上 TCP 80/443/22 探测后是 95 个 ——
 近一半主机屏蔽 ICMP，只靠 ping 会系统性低估。
 
 注意口径：这里量的是「从本机探测得到响应」，不等于「地址已分配」。
@@ -30,7 +30,7 @@ _HOST_UP = re.compile(r"^Host:\s+(\S+).*?Status:\s+Up", re.M)
 
 @dataclass
 class BlockScan:
-    """一个 /24（或更小的扫描单元）的存活情况。"""
+    """一个 /24（或更小的扫描单元）的在用情况。"""
 
     block: object
     alive: list = field(default_factory=list)
@@ -101,7 +101,7 @@ def _run_nmap(target: str, args: list, timeout: int) -> str:
 
 
 def parse_alive(output: str) -> list:
-    """从 nmap 的 grepable 输出里取出存活地址。"""
+    """从 nmap 的 grepable 输出里取出在用地址。"""
     out = []
     for addr in _HOST_UP.findall(output):
         try:
@@ -137,7 +137,7 @@ def scan(prefixes, tcp: bool = True, block_len: int = 24,
         try:
             alive = parse_alive(runner(str(prefix), args, timeout))
         except subprocess.TimeoutExpired:
-            result.errors.append(f"{prefix}：扫描超时（>{timeout}s），该段计为 0 存活")
+            result.errors.append(f"{prefix}：扫描超时（>{timeout}s），该段计为 0 在用")
         except Exception as exc:
             result.errors.append(f"{prefix}：{exc}")
 

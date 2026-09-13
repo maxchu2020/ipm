@@ -1,4 +1,4 @@
-"""存活扫描的单元测试（不真的调用 nmap，用假 runner 注入输出）。"""
+"""在用地址扫描的单元测试（不真的调用 nmap，用假 runner 注入输出）。"""
 
 import ipaddress
 import sys
@@ -73,7 +73,7 @@ class TestScan(unittest.TestCase):
         self.assertEqual(res.total, 512)
 
     def test_empty_blocks_still_reported(self):
-        """没有存活的 /24 也必须出现在结果里，否则「全空」段会凭空消失。"""
+        """没有在用的 /24 也必须出现在结果里，否则「未探测到在用地址」的段会凭空消失。"""
         res = scan([net("10.0.0.0/22")], runner=self._runner(GREPABLE))
         self.assertEqual(len(res.blocks), 4)
         self.assertEqual(sum(1 for b in res.blocks if not b.alive), 2)
@@ -126,18 +126,21 @@ class TestScanReport(unittest.TestCase):
 
     def test_report_sections(self):
         text = render(self._result())
-        for token in ("IPv4 存活扫描", "一、总体结果", "二、按自有前缀汇总",
-                      "有存活地址的 /24"):
+        for token in ("IPv4 在用地址扫描", "一、总体结果", "二、按自有前缀汇总",
+                      "有在用地址的 /24"):
             self.assertIn(token, text)
 
     def test_report_states_measurement_caveat(self):
-        # 「有响应」不等于「已分配」，这条口径必须写在报表里
-        self.assertIn("不等于「地址已分配」", render(self._result()))
+        # 有响应即认定在用；但无响应不代表空闲，这条口径必须写在报表里
+        text = render(self._result())
+        self.assertIn("「在用」指该地址对探测有响应", text)
+        self.assertIn("无响应不代表空闲", text)
+        self.assertIn("下限", text)
 
     def test_empty_blocks_listed_compactly(self):
         res = scan([net("10.0.0.0/22")], runner=lambda t, a, o: GREPABLE)
         text = render(res)
-        self.assertIn("全空的 /24（2 个）", text)
+        self.assertIn("未探测到在用地址的 /24（2 个）", text)
         self.assertIn("10.0.2.0/24", text)
 
     def test_errors_surface_in_report(self):
@@ -149,7 +152,7 @@ class TestScanReport(unittest.TestCase):
 
     def test_subject_has_counts(self):
         subj = subject_line(self._result())
-        self.assertIn("存活 3/512", subj)
+        self.assertIn("在用 3/512", subj)
         self.assertNotIn("⚠", subj)
 
     def test_subject_flags_errors(self):

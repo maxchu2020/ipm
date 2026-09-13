@@ -1,4 +1,4 @@
-"""存活扫描报表。"""
+"""在用地址扫描报表。"""
 
 from __future__ import annotations
 
@@ -6,10 +6,10 @@ import datetime as _dt
 
 from .report import _pad, _rule, _trunc
 
-_SUM_COLS = [("自有前缀", 20), ("总地址", 10), ("存活", 9), ("存活率", 10),
-             ("/24 数", 9), ("有存活的 /24", 14)]
-_BLK_COLS = [("/24 块", 20), ("所属前缀", 20), ("总数", 8), ("存活", 8),
-             ("存活率", 10), ("存活地址", 46)]
+_SUM_COLS = [("自有前缀", 20), ("总地址", 10), ("在用", 9), ("在用率", 10),
+             ("/24 数", 9), ("有在用的 /24", 14)]
+_BLK_COLS = [("/24 块", 20), ("所属前缀", 20), ("总数", 8), ("在用", 8),
+             ("在用率", 10), ("在用地址", 46)]
 
 
 def _pct(x: float) -> str:
@@ -28,7 +28,7 @@ def _fmt_alive(block, limit: int = 4) -> str:
 def render(result, block_len: int = 24, width: int = 120) -> str:
     started = _dt.datetime.fromtimestamp(result.started)
     out = ["=" * width,
-           f"IPv4 存活扫描 — 按 /{block_len} 统计",
+           f"IPv4 在用地址扫描 — 按 /{block_len} 统计",
            "=" * width,
            f"扫描范围  {len(result.prefixes)} 条自有前缀，"
            f"{result.total:,} 个地址，{len(result.blocks)} 个 /{block_len}",
@@ -36,9 +36,10 @@ def render(result, block_len: int = 24, width: int = 120) -> str:
            f"开始时间  {started.strftime('%Y-%m-%d %H:%M:%S')}，"
            f"耗时 {result.elapsed / 60:.1f} 分钟",
            "",
-           "口径说明  统计的是「从本机探测能收到响应」，不等于「地址已分配」。",
-           "          本机若不在对端管理 ACL 白名单内，地址在用也可能无响应；",
-           "          反之无响应也不代表空闲。要看分配情况请用 ipm.py stats。",
+           "口径说明  「在用」指该地址对探测有响应，可据此认定已分配或正在使用。",
+           "          反向不成立：无响应不代表空闲 —— 本机若不在对端的管理 ACL",
+           "          白名单内，地址在用也可能不响应（路由器 Loopback 就是如此）。",
+           "          所以在用数是下限，不是精确值。完整分配情况见 ipm.py stats。",
            ""]
 
     if result.errors:
@@ -47,24 +48,24 @@ def render(result, block_len: int = 24, width: int = 120) -> str:
         out.append("")
 
     out.append(_rule("一、总体结果", width))
-    out.append(f"  存活 {result.alive_count:,} / {result.total:,} 个地址"
+    out.append(f"  在用 {result.alive_count:,} / {result.total:,} 个地址"
                f"（{_pct(result.ratio)}）")
     nonempty = [b for b in result.blocks if b.alive]
-    out.append(f"  {len(result.blocks)} 个 /{block_len} 中，{len(nonempty)} 个有存活地址，"
-               f"{len(result.blocks) - len(nonempty)} 个全空")
+    out.append(f"  {len(result.blocks)} 个 /{block_len} 中，{len(nonempty)} 个有在用地址，"
+               f"{len(result.blocks) - len(nonempty)} 个未探测到在用地址")
     out.append("")
 
     out.append(_rule("二、按自有前缀汇总", width))
     out.extend(_prefix_table(result))
     out.append("")
 
-    out.append(_rule(f"三、有存活地址的 /{block_len}（{len(nonempty)} 个）", width))
+    out.append(_rule(f"三、有在用地址的 /{block_len}（{len(nonempty)} 个）", width))
     out.extend(_block_table(sorted(nonempty, key=lambda b: -b.alive_count)))
     out.append("")
 
     empty = [b for b in result.blocks if not b.alive]
     if empty:
-        out.append(_rule(f"四、全空的 /{block_len}（{len(empty)} 个）", width))
+        out.append(_rule(f"四、未探测到在用地址的 /{block_len}（{len(empty)} 个）", width))
         out.extend(_empty_list(empty))
         out.append("")
     return "\n".join(out)
@@ -93,7 +94,7 @@ def _prefix_table(result) -> list:
 
 def _block_table(blocks) -> list:
     if not blocks:
-        return ["  （没有探测到任何存活地址）"]
+        return ["  （没有探测到任何在用地址）"]
     lines = ["  " + "".join(_pad(n, w) for n, w in _BLK_COLS).rstrip(),
              "  " + "-" * sum(w for _, w in _BLK_COLS)]
     for b in blocks:
@@ -104,15 +105,15 @@ def _block_table(blocks) -> list:
 
 
 def _empty_list(blocks, per_line: int = 5) -> list:
-    """全空的段只列出块名，不必逐个占一行。"""
+    """未探测到在用地址的段只列出块名，不必逐个占一行。"""
     names = [str(b.block) for b in blocks]
     return ["  " + "".join(_pad(n, 22) for n in names[i:i + per_line]).rstrip()
             for i in range(0, len(names), per_line)]
 
 
 def subject_line(result, block_len: int = 24,
-                 prefix: str = "[ipm] IPv4 存活扫描") -> str:
-    head = f"{prefix} — 存活 {result.alive_count:,}/{result.total:,}（{_pct(result.ratio)}）"
+                 prefix: str = "[ipm] IPv4 在用地址扫描") -> str:
+    head = f"{prefix} — 在用 {result.alive_count:,}/{result.total:,}（{_pct(result.ratio)}）"
     if result.errors:
         head += f"，⚠ {len(result.errors)} 段扫描异常"
     return head

@@ -424,7 +424,7 @@ def main(argv=None) -> int:
                    help="邮件配置文件（默认 ./.env）")
     r.set_defaults(func=cmd_rov)
 
-    sc = sub.add_parser("scan", help="对 prefix.list 里的 IPv4 前缀做存活扫描")
+    sc = sub.add_parser("scan", help="对 prefix.list 里的 IPv4 前缀做在用地址扫描")
     sc.add_argument("--prefix-list", type=Path, default=BASE / "prefix.list",
                     help="自有前缀列表（默认 ./prefix.list，只取 IPv4）")
     sc.add_argument("--block-len", type=int, default=24, metavar="N",

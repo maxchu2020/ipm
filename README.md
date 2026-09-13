@@ -116,12 +116,12 @@ ipmlib/irr.py       IRR (RADB) route 对象查询
 ipmlib/rov.py       ROA + IRR 合成授权判定
 ipmlib/rov_report.py 校验报表渲染
 ipmlib/mailer.py    SMTP 推送
-ipmlib/scan.py      nmap 存活扫描
+ipmlib/scan.py      nmap 在用地址扫描
 ipmlib/scan_report.py 扫描报表渲染
 tests/test_ipm.py   IP 统计单元测试
 tests/test_rov.py   ROA/IRR 校验单元测试（离线，不发网络请求）
 tests/test_mailer.py 邮件推送单元测试（离线，不连 SMTP）
-tests/test_scan.py  存活扫描单元测试（离线，不调 nmap）
+tests/test_scan.py  在用地址扫描单元测试（离线，不调 nmap）
 prefix.list         自有前缀（IPv4 / IPv6 混排），一行一条，支持 # 注释
 ROA-IRR.list        前缀 + 现网 origin ASN（NO = 未广播）
 running-config/     设备配置采集文件（.gitignore）
@@ -290,9 +290,9 @@ BCC_EMAILS=
 邮件发送失败时退出码为 `2` 且日志留有明确记录，但不会把校验结果本身判成失败。
 
 
-## 功能三：IPv4 存活扫描
+## 功能三：IPv4 在用地址扫描
 
-对 `prefix.list` 里的 IPv4 前缀逐个探测存活，按 `/24` 统计，每日一次邮件推送。
+对 `prefix.list` 里的 IPv4 前缀逐个探测在用，按 `/24` 统计，每日一次邮件推送。
 
 ```bash
 ./ipm.py scan                      # 完整扫描（ICMP + TCP）
@@ -307,7 +307,7 @@ BCC_EMAILS=
 
 **不能只用 ICMP。** 实测同一条 `/20`：
 
-| 探测方式 | 耗时 | 检出存活 |
+| 探测方式 | 耗时 | 检出在用 |
 | --- | --- | --- |
 | 仅 ICMP | 37 秒 | 50 个 |
 | ICMP + TCP | 315 秒 | **95 个** |
@@ -336,12 +336,12 @@ nmap 参数用了 `-T4 --min-hostgroup 1024`：默认参数下扫一个 `/24` �
 | 小节 | 内容 |
 | --- | --- |
 | ⚠ | 扫描异常（某段 nmap 失败或超时） |
-| 一 | 总体结果：存活数、存活率、多少个 `/24` 有存活 |
+| 一 | 总体结果：在用数、在用率、多少个 `/24` 有在用 |
 | 二 | 按自有前缀汇总 |
-| 三 | 有存活地址的 `/24`，按存活数降序，附存活 IP 样例 |
+| 三 | 有在用地址的 `/24`，按在用数降序，附在用 IP 样例 |
 | 四 | 全空的 `/24`，紧凑列出 |
 
-完整的存活 IP 列表在 CSV/JSON 里（报表中每块只展示前 4 个）。
+完整的在用 IP 列表在 CSV/JSON 里（报表中每块只展示前 4 个）。
 
 ### 定时运行
 
@@ -354,7 +354,7 @@ nmap 参数用了 `-T4 --min-hostgroup 1024`：默认参数下扫一个 `/24` �
 /etc/logrotate.d/ipm-scan              轮转 output/scan-cron.log
 ```
 
-邮件标题：`[ipm] IPv4 存活扫描 — 存活 1,234/21,504（5.74%）`，
+邮件标题：`[ipm] IPv4 在用地址扫描 — 在用 1,234/21,504（5.74%）`，
 某段扫描失败时追加 `⚠ N 段扫描异常`。
 
 > 注：`/opt/project/ip-address-scanner/` 是另一个独立的 ping 扫描项目，
