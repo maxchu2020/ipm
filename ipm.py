@@ -306,7 +306,7 @@ def cmd_scan(args) -> int:
 
     result = scan_mod.scan(prefixes, tcp=not args.icmp_only,
                            block_len=args.block_len, timeout=args.timeout,
-                           progress=progress)
+                           retries=args.retries, progress=progress)
     if sys.stderr.isatty():
         print(file=sys.stderr)
 
@@ -431,6 +431,10 @@ def main(argv=None) -> int:
                     help="按 /N 为单位统计（默认 24）")
     sc.add_argument("--icmp-only", action="store_true",
                     help="只用 ICMP 探测（快得多，但会漏掉约一半屏蔽 ICMP 的主机）")
+    sc.add_argument("--retries", type=int, default=scan_mod.DEFAULT_RETRIES,
+                    metavar="N",
+                    help=f"每个探测最多尝试几次（默认 {scan_mod.DEFAULT_RETRIES}）；"
+                         "单次无响应可能只是丢包，次数太少会漏报在用地址")
     sc.add_argument("--timeout", type=int, default=3600, metavar="SEC",
                     help="单条前缀的扫描超时秒数（默认 3600）")
     sc.add_argument("--report", type=Path,

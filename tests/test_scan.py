@@ -92,6 +92,31 @@ class TestScan(unittest.TestCase):
         self.assertIn("-PS80,443,22", args)
         self.assertIn("-PE", args)
 
+    def test_default_retries_is_three(self):
+        """单次探测无响应可能只是丢包，默认要重试到 3 次。"""
+        runner = self._runner()
+        scan([net("10.0.0.0/24")], runner=runner)
+        args = runner.calls[0][1]
+        self.assertEqual(args[args.index("--max-retries") + 1], "2")
+
+    def test_retries_maps_to_max_retries_minus_one(self):
+        # nmap 的 --max-retries 是重试次数，总尝试次数要减一
+        for attempts, expect in ((1, "0"), (3, "2"), (5, "4")):
+            runner = self._runner()
+            scan([net("10.0.0.0/24")], retries=attempts, runner=runner)
+            args = runner.calls[0][1]
+            self.assertEqual(args[args.index("--max-retries") + 1], expect)
+
+    def test_single_attempt_is_flagged_in_method_label(self):
+        from ipmlib.scan import method_label
+        self.assertIn("丢包会漏报", method_label(True, 1))
+        self.assertNotIn("丢包会漏报", method_label(True, 3))
+
+    def test_retries_shown_in_report(self):
+        res = scan([net("10.0.0.0/24")], retries=3,
+                   runner=lambda t, a, o: GREPABLE)
+        self.assertIn("最多尝试 3 次", render(res))
+
     def test_icmp_only_drops_tcp_probes(self):
         runner = self._runner()
         scan([net("10.0.0.0/24")], tcp=False, runner=runner)
