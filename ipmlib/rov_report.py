@@ -204,12 +204,19 @@ def _unannounced_summary(rows) -> list:
 
 
 def _expiry_overview(results) -> list:
-    """ROA 到期分布——没有触发预警时也要让人看到「最早哪天到期」。"""
-    days = [d for d in (_min_days(effective_vrps(r)) for r in results)
-            if d is not None]
+    """ROA 到期分布——没有触发告警时也要让人看到「最早哪天到期」。
+
+    口径与告警一致，只统计已广播的；未广播的单列一行，避免它们的到期日
+    被误读成「快出事了」。
+    """
+    days = sorted(d for d in
+                  (_min_days(effective_vrps(r)) for r in results if r.announced)
+                  if d is not None)
+    idle = sorted(d for d in
+                  (_min_days(effective_vrps(r)) for r in results
+                   if not r.announced) if d is not None)
     if not days:
-        return []
-    days.sort()
+        return _idle_line(idle)
     buckets = [("已过期", lambda d: d < 0),
                (f"{EXPIRY_CRITICAL} 天内", lambda d: 0 <= d < EXPIRY_CRITICAL),
                (f"{EXPIRY_CRITICAL}-{EXPIRY_WARN} 天",
@@ -221,14 +228,33 @@ def _expiry_overview(results) -> list:
              for name, pred in buckets if any(pred(d) for d in days)]
     first = min(days)
     soonest = f"已过期 {-first} 天" if first < 0 else f"{first} 天后"
-    return ["", f"  ROA 到期分布（{len(days)} 条有 ROA 覆盖）：" + "，".join(parts),
-            f"  最早到期：{soonest}；中位 {days[len(days) // 2]} 天"]
+    return ["", f"  ROA 到期分布（已广播且有 ROA 覆盖的 {len(days)} 条）："
+            + "，".join(parts),
+            f"  最早到期：{soonest}；中位 {days[len(days) // 2]} 天"] + _idle_line(idle)
+
+
+def _idle_line(idle) -> list:
+    """未广播前缀的到期情况：只做说明，不参与告警。"""
+    if not idle:
+        return []
+    soon = sum(1 for d in idle if d < EXPIRY_WARN)
+    line = (f"  另有 {len(idle)} 条未广播前缀有 ROA 覆盖，最早 {min(idle)} 天后到期"
+            f"（{soon} 条在 {EXPIRY_WARN} 天内）；未广播不影响现网，不计入上面的告警")
+    return ["", line]
 
 
 def _expiry_rows(results, lo, hi) -> list:
-    """剩余天数落在 [lo, hi) 区间的前缀，按最紧急的排前面。"""
+    """剩余天数落在 [lo, hi) 区间的**已广播**前缀，按最紧急的排前面。
+
+    只看已广播的：ROA 过期只有在该前缀正在广播时才会造成实际故障
+    （valid 掉成 invalid、被上游丢弃）。未广播前缀的 ROA 过期不影响现网，
+    把它们混进告警只会让真正要紧的那批被淹没 —— 它们的到期日仍然在
+    NOT-ANNOUNCED 明细表的「ROA 到期」列里可查。
+    """
     rows = []
     for r in results:
+        if not r.announced:
+            continue
         days = _min_days(effective_vrps(r))
         if days is not None and lo <= days < hi:
             rows.append((days, r))
@@ -269,7 +295,7 @@ def _expiry_section(results, width: int) -> list:
         if expired:
             head += f"（其中 {expired} 条已过期）"
         out += ["!" * width,
-                f"!! 紧急：{head}前缀的 ROA 将在 {EXPIRY_CRITICAL} 天内到期",
+                f"!! 紧急：{head}已广播前缀的 ROA 将在 {EXPIRY_CRITICAL} 天内到期",
                 f"!! ROA 过期后该广播立即从 valid 变 invalid，会被上游丢弃 —— 请尽快续签",
                 "!" * width,
                 ""]
@@ -279,7 +305,7 @@ def _expiry_section(results, width: int) -> list:
     if warn:
         out.append(_rule(f"⚠ ROA 到期预警（{EXPIRY_CRITICAL}~{EXPIRY_WARN} 天）",
                          width))
-        out.append(f"  {len(warn)} 条前缀的 ROA 将在 {EXPIRY_WARN} 天内到期，"
+        out.append(f"  {len(warn)} 条已广播前缀的 ROA 将在 {EXPIRY_WARN} 天内到期，"
                    "建议排进续签计划。")
         out += _expiry_table(warn)
         out.append("")

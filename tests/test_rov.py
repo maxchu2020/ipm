@@ -363,11 +363,15 @@ class TestRovReport(unittest.TestCase):
             self.assertIn(token, text)
 
     def _render(self, *pairs):
-        """pairs: (前缀, 剩余天数) —— 构造一份只含到期信息的报表。"""
+        """pairs: (前缀, 剩余天数[, origin]) —— origin 传 None 表示未广播。"""
         from ipmlib.rov_report import render
-        vrps = [vrp(p, 65000, int(p.split("/")[1]), valid_to=_soon(d))
-                for p, d in pairs]
-        rows = [(net(p), 65000) for p, _ in pairs]
+        vrps, rows = [], []
+        for item in pairs:
+            prefix, days = item[0], item[1]
+            origin = item[2] if len(item) > 2 else 65000
+            vrps.append(vrp(prefix, 65000, int(prefix.split("/")[1]),
+                            valid_to=_soon(days)))
+            rows.append((net(prefix), origin))
         return render(evaluate(rows, vrps, {}, {}),
                       {"buildtime": "x", "expiry_kind": "cert"}, "whois.test")
 
@@ -400,6 +404,25 @@ class TestRovReport(unittest.TestCase):
         self.assertNotIn("紧急", text)
         self.assertNotIn("ROA 到期预警", text)
 
+    def test_unannounced_prefix_never_alerts(self):
+        """未广播前缀的 ROA 过期不影响现网，不能挤占告警位。"""
+        text = self._render(("10.0.0.0/24", 3, None))
+        self.assertNotIn("紧急", text)
+        self.assertNotIn("ROA 到期预警", text)
+        self.assertIn("不计入上面的告警", text)
+
+    def test_announced_alerts_while_unannounced_only_noted(self):
+        text = self._render(("10.0.0.0/24", 3), ("10.0.1.0/24", 2, None))
+        head = text.split("一、总体结果")[0]
+        self.assertIn("10.0.0.0/24", head)       # 已广播 -> 进紧急块
+        self.assertNotIn("10.0.1.0/24", head)    # 未广播 -> 不进
+        self.assertIn("另有 1 条未广播前缀", text)
+
+    def test_overview_counts_announced_only(self):
+        text = self._render(("10.0.0.0/24", 100), ("10.0.1.0/24", 5, None))
+        self.assertIn("已广播且有 ROA 覆盖的 1 条", text)
+        self.assertIn("最早到期：100 天后", text)   # 不能被未广播的 5 天带偏
+
     def test_subject_calls_out_critical_tier(self):
         from ipmlib.rov_report import subject_line
         vrps = [vrp("10.0.0.0/24", 65000, 24, valid_to=_soon(5)),
@@ -408,6 +431,13 @@ class TestRovReport(unittest.TestCase):
         subj = subject_line(evaluate(rows, vrps, {}, {}))
         self.assertIn("1 条 ROA 14 天内到期", subj)
         self.assertIn("1 条 ROA 30 天内到期", subj)
+
+    def test_subject_ignores_unannounced_expiry(self):
+        from ipmlib.rov_report import subject_line
+        vrps = [vrp("10.0.0.0/24", 65000, 24, valid_to=_soon(2))]
+        subj = subject_line(evaluate([(net("10.0.0.0/24"), None)], vrps, {}, {}))
+        self.assertNotIn("⚠", subj)
+        self.assertIn("正常", subj)
 
     def test_subject_says_expired_when_all_critical_are_expired(self):
         from ipmlib.rov_report import subject_line
