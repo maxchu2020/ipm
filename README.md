@@ -116,9 +116,12 @@ ipmlib/irr.py       IRR (RADB) route 对象查询
 ipmlib/rov.py       ROA + IRR 合成授权判定
 ipmlib/rov_report.py 校验报表渲染
 ipmlib/mailer.py    SMTP 推送
+ipmlib/scan.py      nmap 存活扫描
+ipmlib/scan_report.py 扫描报表渲染
 tests/test_ipm.py   IP 统计单元测试
 tests/test_rov.py   ROA/IRR 校验单元测试（离线，不发网络请求）
 tests/test_mailer.py 邮件推送单元测试（离线，不连 SMTP）
+tests/test_scan.py  存活扫描单元测试（离线，不调 nmap）
 prefix.list         自有前缀（IPv4 / IPv6 混排），一行一条，支持 # 注释
 ROA-IRR.list        前缀 + 现网 origin ASN（NO = 未广播）
 running-config/     设备配置采集文件（.gitignore）
@@ -285,3 +288,75 @@ BCC_EMAILS=
 
 密送地址只进投递列表、不写进信头 —— 写进去就不是密送了（有测试锁住这一点）。
 邮件发送失败时退出码为 `2` 且日志留有明确记录，但不会把校验结果本身判成失败。
+
+
+## 功能三：IPv4 存活扫描
+
+对 `prefix.list` 里的 IPv4 前缀逐个探测存活，按 `/24` 统计，每日一次邮件推送。
+
+```bash
+./ipm.py scan                      # 完整扫描（ICMP + TCP）
+./ipm.py scan --icmp-only          # 只用 ICMP，快但漏报多
+./ipm.py scan --block-len 26       # 换成 /26 粒度统计
+./ipm.py scan --report output/scan-report.txt --csv output/scan.csv --email
+```
+
+### 探测方式
+
+`nmap -sn`，同时用 ICMP echo、TCP SYN(80/443/22)、TCP ACK(80) 探测。
+
+**不能只用 ICMP。** 实测同一条 `/20`：
+
+| 探测方式 | 耗时 | 检出存活 |
+| --- | --- | --- |
+| 仅 ICMP | 37 秒 | 50 个 |
+| ICMP + TCP | 315 秒 | **95 个** |
+
+近一半主机屏蔽 ICMP，只 ping 会系统性低估。全部 21,504 个地址约 30 分钟，
+对每日一次完全可接受。
+
+nmap 参数用了 `-T4 --min-hostgroup 1024`：默认参数下扫一个 `/24` 要 52 秒，
+调优后整条 `/20` 才 37 秒，差一个数量级。扫描按**前缀**为单位调用 nmap
+（让它自己批量并发），统计才按 `/24` 归并 —— 逐个 `/24` 起进程会慢得多。
+
+### 口径说明（重要）
+
+统计的是**「从本机探测能收到响应」**，不等于**「地址已分配」**：
+
+- 本机若不在对端的管理 ACL 白名单内，地址在用也可能无响应。例如路由器
+  Loopback 通常只放行特定源网段 —— 实测 `69.163.120.8`（LAX 路由器 Loopback0）
+  从本机 ping 不通，但它显然在用。
+- 反之，无响应也不代表空闲。
+
+要看**分配**情况请用 `ipm.py stats`（功能一，从 running-config 推导）。
+两者互补：扫描能发现配置里没有的活动主机，配置能发现不响应探测的已分配地址。
+
+### 报表结构
+
+| 小节 | 内容 |
+| --- | --- |
+| ⚠ | 扫描异常（某段 nmap 失败或超时） |
+| 一 | 总体结果：存活数、存活率、多少个 `/24` 有存活 |
+| 二 | 按自有前缀汇总 |
+| 三 | 有存活地址的 `/24`，按存活数降序，附存活 IP 样例 |
+| 四 | 全空的 `/24`，紧凑列出 |
+
+完整的存活 IP 列表在 CSV/JSON 里（报表中每块只展示前 4 个）。
+
+### 定时运行
+
+每天 **04:00** 一次（错开 `ip-scanner.timer` 的 02:00 与 `ipm-rov.timer` 的
+07:00/19:00，避免多个扫描任务同时抢带宽）。
+
+```
+/etc/systemd/system/ipm-scan.timer     每日 04:00
+/etc/systemd/system/ipm-scan.service   oneshot，TimeoutStartSec=7200
+/etc/logrotate.d/ipm-scan              轮转 output/scan-cron.log
+```
+
+邮件标题：`[ipm] IPv4 存活扫描 — 存活 1,234/21,504（5.74%）`，
+某段扫描失败时追加 `⚠ N 段扫描异常`。
+
+> 注：`/opt/project/ip-address-scanner/` 是另一个独立的 ping 扫描项目，
+> 扫的是完全不同的地址段（`154.82.64.0/18`、`206.238.0.0/16` 等），与本功能
+> 没有地址重叠，但扫描逻辑有重复。若日后要合并，这里是入口。

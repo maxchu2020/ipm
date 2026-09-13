@@ -22,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ipmlib import irr as irr_mod
 from ipmlib import mailer
+from ipmlib import scan as scan_mod
+from ipmlib import scan_report
 from ipmlib import roa as roa_mod
 from ipmlib.parsers import parse_file
 from ipmlib.report import render_text, role_of
@@ -287,6 +289,91 @@ def _write_rov_json(results, meta, path) -> None:
                           encoding="utf-8")
 
 
+def cmd_scan(args) -> int:
+    if not scan_mod.nmap_available():
+        raise SystemExit("未找到 nmap，请先安装：dnf install -y nmap")
+
+    prefixes = [p for p in load_prefixes(args.prefix_list) if p.version == 4]
+    if not prefixes:
+        raise SystemExit(f"{args.prefix_list} 里没有 IPv4 前缀")
+
+    def progress(i, total, prefix):
+        msg = f"[{i}/{total}] 扫描 {prefix} …"
+        if sys.stderr.isatty():
+            print(msg, file=sys.stderr, end="\r")
+        else:
+            print(msg, file=sys.stderr)
+
+    result = scan_mod.scan(prefixes, tcp=not args.icmp_only,
+                           block_len=args.block_len, timeout=args.timeout,
+                           progress=progress)
+    if sys.stderr.isatty():
+        print(file=sys.stderr)
+
+    report = scan_report.render(result, args.block_len)
+    attachments = []
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(report + "\n", encoding="utf-8")
+        attachments.append(args.report)
+        print(f"[ok] 报表已写入 {args.report}")
+    else:
+        print(report)
+
+    if args.csv:
+        _write_scan_csv(result, args.csv)
+        attachments.append(args.csv)
+        print(f"[ok] 明细已写入 {args.csv}")
+    if args.json:
+        _write_scan_json(result, args.json)
+        attachments.append(args.json)
+        print(f"[ok] 结构化结果已写入 {args.json}")
+
+    if args.email:
+        cfg = mailer.MailConfig(mailer.load_env(args.env))
+        subject = scan_report.subject_line(result, args.block_len)
+        try:
+            sent = mailer.send(cfg, subject, report, attachments)
+        except Exception as exc:
+            print(f"[error] 邮件发送失败：{exc}", file=sys.stderr)
+            return 2
+        print(f"[ok] 邮件已发送给 {len(sent)} 个地址：{subject}")
+    return 0
+
+
+def _write_scan_csv(result, path) -> None:
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(["block", "owned_prefix", "total", "alive", "alive_ratio",
+                    "alive_ips"])
+        for b in result.blocks:
+            w.writerow([str(b.block), str(b.prefix), b.total, b.alive_count,
+                        f"{b.ratio:.6f}",
+                        " ".join(str(ip) for ip in b.alive)])
+
+
+def _write_scan_json(result, path) -> None:
+    data = {
+        "method": result.method,
+        "started": result.started,
+        "elapsed_sec": round(result.elapsed, 1),
+        "total": result.total,
+        "alive": result.alive_count,
+        "ratio": round(result.ratio, 6),
+        "errors": result.errors,
+        "blocks": [{
+            "block": str(b.block),
+            "owned_prefix": str(b.prefix),
+            "total": b.total,
+            "alive": b.alive_count,
+            "ratio": round(b.ratio, 6),
+            "alive_ips": [str(ip) for ip in b.alive],
+        } for b in result.blocks],
+    }
+    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                          encoding="utf-8")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="ipm", description="根据 router config 统计 IP 使用情况")
@@ -336,6 +423,24 @@ def main(argv=None) -> int:
     r.add_argument("--env", type=Path, default=BASE / ".env",
                    help="邮件配置文件（默认 ./.env）")
     r.set_defaults(func=cmd_rov)
+
+    sc = sub.add_parser("scan", help="对 prefix.list 里的 IPv4 前缀做存活扫描")
+    sc.add_argument("--prefix-list", type=Path, default=BASE / "prefix.list",
+                    help="自有前缀列表（默认 ./prefix.list，只取 IPv4）")
+    sc.add_argument("--block-len", type=int, default=24, metavar="N",
+                    help="按 /N 为单位统计（默认 24）")
+    sc.add_argument("--icmp-only", action="store_true",
+                    help="只用 ICMP 探测（快得多，但会漏掉约一半屏蔽 ICMP 的主机）")
+    sc.add_argument("--timeout", type=int, default=3600, metavar="SEC",
+                    help="单条前缀的扫描超时秒数（默认 3600）")
+    sc.add_argument("--report", type=Path,
+                    help="把报表写入文件而不是打印到 stdout")
+    sc.add_argument("--csv", type=Path, help="把逐块结果另存为 CSV")
+    sc.add_argument("--json", type=Path, help="把结果另存为 JSON")
+    sc.add_argument("--email", action="store_true", help="把报表通过邮件推送")
+    sc.add_argument("--env", type=Path, default=BASE / ".env",
+                    help="邮件配置文件（默认 ./.env）")
+    sc.set_defaults(func=cmd_scan)
 
     args = ap.parse_args(argv)
     return args.func(args)
