@@ -12,10 +12,12 @@ BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
 from ipmlib import roa as roa_mod
+from ipmlib import irr as irr_mod
 from ipmlib.irr import IrrRoute, _parse
 from ipmlib.roa import INVALID, NOTFOUND, VALID, Vrp, covering, validate
-from ipmlib.rov import (IRR_MATCH, NOT_ANNOUNCED, NO_AUTH, QUERY_FAILED,
-                        ROA_INVALID, ROA_MATCH, evaluate, load_list)
+from ipmlib.rov import (IRR_MATCH, IRR_SKIPPED, NOT_ANNOUNCED, NO_AUTH,
+                        QUERY_FAILED, ROA_INVALID, ROA_MATCH, evaluate,
+                        load_list)
 
 
 def net(s):
@@ -259,13 +261,24 @@ class TestRoaExpiry(unittest.TestCase):
         self.assertEqual(days_until(_soon(0.5)), 1)
         self.assertEqual(days_until(_soon(-2)), -2)
 
-    def test_expiry_warning_uses_effective_vrp(self):
-        from ipmlib.rov_report import _min_days
+    def test_expiry_uses_latest_matching_vrp(self):
+        # 两条 ROA 都匹配时，只要还有一条有效广播就是 valid —— 不能按先到期的那条告警
+        from ipmlib.rov_report import days_until, expiry_stamp, subject_line
         soon = vrp("10.0.0.0/24", 65000, 24, valid_to=_soon(5))
         later = vrp("10.0.0.0/23", 65000, 24, valid_to=_soon(300))
         rows = evaluate([(net("10.0.0.0/24"), 65000)], [soon, later], {}, {})
         self.assertEqual(rows[0].verdict, ROA_MATCH)
-        self.assertLess(_min_days(rows[0].roa_matched), 14)
+        self.assertEqual(len(rows[0].roa_matched), 2)
+        self.assertGreater(days_until(expiry_stamp(rows[0])), 200)
+        self.assertIn("正常", subject_line(rows))
+
+    def test_expiry_ignores_non_matching_cover_when_matched(self):
+        # 覆盖但不匹配的 VRP（别的 ASN）到期与这条广播无关
+        from ipmlib.rov_report import days_until, expiry_stamp
+        mine = vrp("10.0.0.0/24", 65000, 24, valid_to=_soon(300))
+        other = vrp("10.0.0.0/16", 65001, 24, valid_to=_soon(3))
+        rows = evaluate([(net("10.0.0.0/24"), 65000)], [mine, other], {}, {})
+        self.assertGreater(days_until(expiry_stamp(rows[0])), 200)
 
 
 def _soon(days):
@@ -501,3 +514,96 @@ class TestGraphqlLimit(unittest.TestCase):
         text = render_rov(results, meta, "whois.radb.net")
         self.assertIn("1000 条上限", text)
         self.assertIn("10.0.0.0/16", text)
+
+
+class TestIrrErrorResponse(unittest.TestCase):
+    """whois 返回错误文本时必须记为查询失败，不能当成「没有 route」判 NO-AUTH。"""
+
+    P = net("10.0.0.0/24")
+
+    def _query(self, text):
+        from unittest import mock
+        with mock.patch.object(irr_mod, "_ask", lambda *a, **k: text):
+            return irr_mod.query([self.P], delay=0)
+
+    def test_error_line_is_failure(self):
+        results, errors = self._query("%  ERROR: Query limit exceeded\n")
+        self.assertNotIn(self.P, results)
+        self.assertIn("Query limit exceeded", errors[self.P])
+        verdict = evaluate([(self.P, 65000)], [], results, errors)[0].verdict
+        self.assertEqual(verdict, QUERY_FAILED)
+
+    def test_access_denied_is_failure(self):
+        _, errors = self._query("% Access denied\n")
+        self.assertIn(self.P, errors)
+
+    def test_empty_response_is_failure(self):
+        _, errors = self._query("")
+        self.assertIn("空响应", errors[self.P])
+
+    def test_no_entries_found_is_normal(self):
+        results, errors = self._query("% No entries found for the selected source(s).\n")
+        self.assertEqual(errors, {})
+        self.assertEqual(results[self.P], [])
+
+
+class TestNoIrr(unittest.TestCase):
+    """--no-irr 时没查过 IRR，无 ROA 覆盖的前缀不能判成 NO-AUTH。"""
+
+    def test_skipped_not_no_auth(self):
+        from ipmlib.rov_report import render, subject_line
+        rows = [(net("10.0.0.0/24"), 65000), (net("10.0.1.0/24"), 65000)]
+        vrps = [vrp("10.0.1.0/24", 65000, 24, valid_to=_soon(300))]
+        results = evaluate(rows, vrps, {}, {}, irr_checked=False)
+        self.assertEqual([r.verdict for r in results], [IRR_SKIPPED, ROA_MATCH])
+        subj = subject_line(results)
+        self.assertNotIn("无授权", subj)
+        self.assertIn("未查 IRR", subj)
+        text = render(results, {"buildtime": "x"}, None)
+        self.assertIn("本次未查询（--no-irr）", text)
+        self.assertIn("[未查询]", text)
+
+    def test_roa_verdicts_unaffected(self):
+        vrps = [vrp("10.0.0.0/24", 65001, 24)]
+        res = evaluate([(net("10.0.0.0/24"), 65000)], vrps, {}, {}, irr_checked=False)
+        self.assertEqual(res[0].verdict, ROA_INVALID)
+
+
+class TestDumpSanity(unittest.TestCase):
+    """dump 被截断或格式变了时要直接报错，不能让所有前缀悄悄变成 notfound。"""
+
+    def _fake(self, body):
+        import io
+        from unittest import mock
+
+        class Resp(io.BytesIO):
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return mock.patch.object(roa_mod.urllib.request, "urlopen",
+                                 lambda *a, **k: Resp(body))
+
+    LINE = b'{"prefix":"10.0.0.0/24","asn":65000,"maxLength":24,"ta":"t","expires":1},\n'
+
+    def test_too_few_vrps_raises(self):
+        body = b'{"metadata":{"buildtime":"x"},"roas":[\n' + self.LINE + b"]}\n"
+        with self._fake(body):
+            with self.assertRaises(RuntimeError):
+                roa_mod._download("http://x", [net("10.0.0.0/8")])
+
+    def test_single_line_format_raises(self):
+        # 不再一行一条时，逐行解析一条也拿不到
+        body = b'{"roas":[{"prefix":"10.0.0.0/24","asn":65000,"maxLength":24}]}'
+        with self._fake(body):
+            with self.assertRaises(RuntimeError):
+                roa_mod._download("http://x", [net("10.0.0.0/8")])
+
+    def test_enough_vrps_ok(self):
+        with self._fake(b"[\n" + self.LINE * 3 + b"]\n"):
+            vrps, meta = roa_mod._download("http://x", [net("10.0.0.0/8")], min_total=3)
+        self.assertEqual(meta["total_vrps"], 3)
+        self.assertEqual(len(vrps), 3)

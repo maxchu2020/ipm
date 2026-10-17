@@ -50,8 +50,29 @@ def query(prefixes, server: str = WHOIS_SERVER, port: int = WHOIS_PORT,
         if text is None:
             errors[prefix] = "查询失败（超时或连接错误）"
             continue
+        # 限速、拒绝访问、空响应解析出来同样是「没有 route」，不分开就会误报成无授权
+        bad = response_error(text)
+        if bad:
+            errors[prefix] = f"查询失败（{bad}）"
+            continue
         results[prefix] = _parse(text, prefix, exclude_sources)
     return results, errors
+
+
+_ERROR_MARKERS = ("ERROR", "DENIED", "LIMIT EXCEEDED")
+
+
+def response_error(text: str) -> str:
+    """whois 响应本身是否是一次失败的查询；正常（含查无结果）返回空串。
+
+    「% No entries found」是正常的查无结果，不算失败。
+    """
+    if not text.strip():
+        return "空响应"
+    for line in text.splitlines():
+        if line.startswith("%") and any(m in line.upper() for m in _ERROR_MARKERS):
+            return line.lstrip("% ").strip()[:80]
+    return ""
 
 
 def _obj_type(prefix) -> str:

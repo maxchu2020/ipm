@@ -7,8 +7,9 @@ from collections import Counter
 
 from . import roa as roa_mod
 from .report import _pad, _rule, _trunc
-from .rov import (IRR_MATCH, MATCHED, NOT_ANNOUNCED, NO_AUTH, QUERY_FAILED,
-                  ROA_INVALID, ROA_MATCH, VERDICT_DESC, VERDICT_ORDER)
+from .rov import (IRR_MATCH, IRR_SKIPPED, MATCHED, NOT_ANNOUNCED, NO_AUTH,
+                  QUERY_FAILED, ROA_INVALID, ROA_MATCH, VERDICT_DESC,
+                  VERDICT_ORDER)
 
 _COLS = [("前缀", 20), ("现网 origin", 12), ("ROA", 10),
          ("ROA 登记 (maxLen)", 30), ("ROA 到期", 20),
@@ -42,7 +43,9 @@ def _fmt_roa(res) -> str:
     return "、".join(_vrp_label(v, res.prefix) for v in res.roa_covering)
 
 
-def _fmt_irr(res) -> str:
+def _fmt_irr(res, irr_checked: bool = True) -> str:
+    if not irr_checked:
+        return "[未查询]"
     if res.irr_error:
         return f"[{res.irr_error}]"
     if not res.irr_routes:
@@ -56,12 +59,11 @@ def _fmt_irr(res) -> str:
 
 def _fmt_expiry(res) -> str:
     """给出真正起作用那条 VRP 的到期日；剩余天数少的加标记。"""
-    vrps = res.roa_matched or res.roa_usable or res.roa_covering
-    days = _min_days(vrps)
-    if days is None:
+    stamp = expiry_stamp(res)
+    if stamp is None:
         return "-"
-    date = _dt.datetime.utcfromtimestamp(
-        min(v.expiry for v in vrps if v.expiry)).strftime("%Y-%m-%d")
+    days = days_until(stamp)
+    date = _dt.datetime.utcfromtimestamp(stamp).strftime("%Y-%m-%d")
     if days < 0:
         return f"{date} 已过期!"
     if days < EXPIRY_CRITICAL:
@@ -87,17 +89,25 @@ def effective_vrps(res) -> list:
 
 
 def expiry_stamp(res):
+    """这条前缀的 ROA 实际什么时候失效。
+
+    有匹配的 VRP 时取**最晚**的那条：只要还有一条匹配的 VRP 有效，广播就仍是
+    valid（ROA 换签期间新旧两份重叠很常见，取最早会误报到期）。没有匹配时
+    没法说哪条会起作用，保守取最早。
+    """
     stamps = [v.expiry for v in effective_vrps(res) if v.expiry]
-    return min(stamps) if stamps else None
+    if not stamps:
+        return None
+    return max(stamps) if res.roa_matched else min(stamps)
 
 
-def _min_days(vrps):
-    """这些 VRP 中最早的到期日距今多少天；没有可用到期信息则返回 None。"""
-    stamps = [v.expiry for v in vrps if v.expiry]
-    return days_until(min(stamps)) if stamps else None
+def _days_left(res):
+    """距这条前缀的 ROA 失效还有几天；没有可用到期信息则返回 None。"""
+    stamp = expiry_stamp(res)
+    return days_until(stamp) if stamp is not None else None
 
 
-def _row(res) -> str:
+def _row(res, irr_checked: bool = True) -> str:
     origin = f"AS{res.origin}" if res.announced else "未广播"
     if res.announced:
         roa = res.roa_state
@@ -106,7 +116,7 @@ def _row(res) -> str:
         roa = "可授权" if res.roa_usable else ("长度不足" if res.roa_covering
                                                else "无登记")
     vals = [str(res.prefix), origin, roa, _fmt_roa(res), _fmt_expiry(res),
-            _fmt_irr(res), res.verdict]
+            _fmt_irr(res, irr_checked), res.verdict]
     return "  " + "".join(_pad(_trunc(v, w), w)
                           for v, (_, w) in zip(vals, _COLS)).rstrip()
 
@@ -116,7 +126,9 @@ def _header() -> list:
             "  " + "-" * sum(w for _, w in _COLS)]
 
 
-def render(results, roa_meta, irr_server: str, width: int = 128) -> str:
+def render(results, roa_meta, irr_server, width: int = 128) -> str:
+    """irr_server 为 None 表示本次没查 IRR（--no-irr）。"""
+    irr_checked = irr_server is not None
     counts = Counter(r.verdict for r in results)
     announced = [r for r in results if r.announced]
     matched = [r for r in announced if r.matched]
@@ -134,8 +146,9 @@ def render(results, roa_meta, irr_server: str, width: int = 128) -> str:
            f"命中相关 VRP {roa_meta.get('relevant_vrps', '?')} 条"
            f"（全量 {roa_meta.get('total_vrps', '?')} 条）",
            f"ROA 到期  {roa_meta.get('expiry_source', '?')}",
-           f"IRR 数据  {irr_server}，只取精确前缀的 route 对象，"
-           f"已排除 IRRd 由 ROA 自动转换的 source: RPKI 伪源",
+           (f"IRR 数据  {irr_server}，只取精确前缀的 route 对象，"
+            f"已排除 IRRd 由 ROA 自动转换的 source: RPKI 伪源" if irr_checked
+            else "IRR 数据  ⚠ 本次未查询（--no-irr），无 ROA 覆盖的前缀无法判定"),
            f"生成时间  {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
            "",
            "判定口径  ROA 优先于 IRR：ROA 覆盖且 origin 匹配即 match；",
@@ -179,6 +192,7 @@ def render(results, roa_meta, irr_server: str, width: int = 128) -> str:
         ("五、ROA-MATCH —— ROA 校验通过", ROA_MATCH),
         ("六、NOT-ANNOUNCED —— 现网未广播", NOT_ANNOUNCED),
         ("七、QUERY-FAILED —— IRR 查询失败", QUERY_FAILED),
+        ("八、IRR-SKIPPED —— 无 ROA 覆盖，未查 IRR", IRR_SKIPPED),
     ]
     for title, verdict in sections:
         rows = [r for r in results if r.verdict == verdict]
@@ -186,16 +200,20 @@ def render(results, roa_meta, irr_server: str, width: int = 128) -> str:
             continue
         out.append(_rule(f"{title}（{len(rows)} 条）", width))
         if verdict == NOT_ANNOUNCED:
-            out.extend(_unannounced_summary(rows))
+            out.extend(_unannounced_summary(rows, irr_checked))
         out.extend(_header())
-        out.extend(_row(r) for r in rows)
+        out.extend(_row(r, irr_checked) for r in rows)
         out.append("")
 
     return "\n".join(out)
 
 
-def _unannounced_summary(rows) -> list:
+def _unannounced_summary(rows, irr_checked: bool = True) -> list:
     """未广播前缀看的是「上线后能不能通过校验」，而不是「有没有 ROA 记录」。"""
+    if not irr_checked:
+        usable = sum(1 for r in rows if r.roa_usable)
+        return [f"  若要上线，现有 ROA 能放行 {usable} 条，不能放行 "
+                f"{len(rows) - usable} 条（本次未查 IRR）", ""]
     both = [r for r in rows if r.roa_usable and r.irr_routes]
     roa_only = [r for r in rows if r.roa_usable and not r.irr_routes]
     irr_only = [r for r in rows if not r.roa_usable and r.irr_routes]
@@ -216,12 +234,10 @@ def _expiry_overview(results) -> list:
     口径与告警一致，只统计已广播的；未广播的单列一行，避免它们的到期日
     被误读成「快出事了」。
     """
-    days = sorted(d for d in
-                  (_min_days(effective_vrps(r)) for r in results if r.announced)
+    days = sorted(d for d in (_days_left(r) for r in results if r.announced)
                   if d is not None)
-    idle = sorted(d for d in
-                  (_min_days(effective_vrps(r)) for r in results
-                   if not r.announced) if d is not None)
+    idle = sorted(d for d in (_days_left(r) for r in results if not r.announced)
+                  if d is not None)
     if not days:
         return _idle_line(idle)
     buckets = [("已过期", lambda d: d < 0),
@@ -262,7 +278,7 @@ def _expiry_rows(results, lo, hi) -> list:
     for r in results:
         if not r.announced:
             continue
-        days = _min_days(effective_vrps(r))
+        days = _days_left(r)
         if days is not None and lo <= days < hi:
             rows.append((days, r))
     rows.sort(key=lambda x: (x[0], str(x[1].prefix)))
@@ -275,7 +291,7 @@ def _expiry_table(rows) -> list:
            "  " + "-" * 100]
     for days, r in rows:
         vrps = effective_vrps(r)
-        stamp = min(v.expiry for v in vrps if v.expiry)
+        stamp = expiry_stamp(r)
         left = "已过期" if days < 0 else f"{days} 天"
         out.append("  " + _pad(_trunc(str(r.prefix), 22), 22)
                    + _pad(f"AS{r.origin}" if r.announced else "未广播", 12)
@@ -324,6 +340,7 @@ def subject_line(results, prefix: str = "[ipm] ROA/IRR 校验") -> str:
     announced = [r for r in results if r.announced]
     bad = [r for r in results if r.verdict in (ROA_INVALID, NO_AUTH)]
     failed = [r for r in results if r.verdict == QUERY_FAILED]
+    skipped = [r for r in results if r.verdict == IRR_SKIPPED]
     critical = _expiry_rows(results, -10 ** 6, EXPIRY_CRITICAL)
     warn = _expiry_rows(results, EXPIRY_CRITICAL, EXPIRY_WARN)
 
@@ -338,6 +355,8 @@ def subject_line(results, prefix: str = "[ipm] ROA/IRR 校验") -> str:
         alerts.append(f"{len(warn)} 条 ROA {EXPIRY_WARN} 天内到期")
     if failed:
         alerts.append(f"{len(failed)} 条查询失败")
+    if skipped:
+        alerts.append(f"{len(skipped)} 条无 ROA 且未查 IRR")
 
     if alerts:
         return f"{prefix} ⚠ " + "，".join(alerts)

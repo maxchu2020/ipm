@@ -32,6 +32,9 @@ CACHE_MAX_AGE = 0
 # dump 自身的构建时间超过这个值就提示数据源偏旧（不是我们缓存旧）
 STALE_BUILDTIME = 2 * 3600
 CACHE_SCHEMA = 2                   # 缓存结构变了就作废重取
+# 全网 VRP 有几十万条。解析出的总数低于这个值，说明 dump 被截断或格式变了
+# （例如不再一行一条）—— 这时所有前缀都会悄悄变成 notfound，必须直接报错。
+MIN_TOTAL_VRPS = 100_000
 
 # GraphQL 单次最多返回的 ROA 条数。返回条数到了上限说明结果可能被截断，
 # 被截掉的 VRP 会悄悄退回链路有效期，所以要在报表里点名。
@@ -136,7 +139,7 @@ def _vrp_from(d: dict) -> Vrp:
                int(d.get("validTo") or 0), int(d.get("validFrom") or 0))
 
 
-def _download(url: str, parents):
+def _download(url: str, parents, min_total: int = MIN_TOTAL_VRPS):
     """流式过滤全量导出。
 
     导出有上百 MB，但每个 VRP 独占一行，逐行解析即可，不必整份读进内存。
@@ -164,6 +167,10 @@ def _download(url: str, parents):
             if _relevant(net, parents):
                 vrps.append(Vrp(net, int(entry["asn"]), int(entry["maxLength"]),
                                 int(entry.get("expires", 0)), entry.get("ta", "")))
+    if meta["total_vrps"] < min_total:
+        raise RuntimeError(
+            f"ROA dump 只解析出 {meta['total_vrps']} 条 VRP（下限 {min_total}），"
+            f"疑似下载被截断或 {url} 格式变了，本次不出校验结论")
     return vrps, meta
 
 

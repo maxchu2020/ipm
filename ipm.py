@@ -185,8 +185,10 @@ def cmd_rov(args) -> int:
             prefixes, server=args.whois_server, delay=args.irr_delay,
             progress=progress)
 
-    results = evaluate(rows, vrps, irr_results, irr_errors)
-    report = render_rov(results, meta, args.whois_server)
+    results = evaluate(rows, vrps, irr_results, irr_errors,
+                       irr_checked=not args.no_irr)
+    report = render_rov(results, meta,
+                        None if args.no_irr else args.whois_server)
 
     attachments = []
     if args.report:

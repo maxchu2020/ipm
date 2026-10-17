@@ -8,6 +8,7 @@
 * ``IRR-MATCH``   —— 没有任何 ROA 覆盖，但 IRR 有精确 route 对象且 origin 匹配
 * ``NO-AUTH``     —— 没有 ROA 覆盖，IRR 也没有匹配的 route 对象
 * ``NOT-ANNOUNCED`` —— 现网未广播（第二列为 NO），无 origin 可比，单独归类
+* ``IRR-SKIPPED`` —— 没有 ROA 覆盖，且本次没查 IRR（--no-irr），不下结论
 """
 
 from __future__ import annotations
@@ -24,10 +25,11 @@ IRR_MATCH = "IRR-MATCH"
 NO_AUTH = "NO-AUTH"
 NOT_ANNOUNCED = "NOT-ANNOUNCED"
 QUERY_FAILED = "QUERY-FAILED"
+IRR_SKIPPED = "IRR-SKIPPED"
 
 # 报表里的排列顺序：先看有问题的
 VERDICT_ORDER = [ROA_INVALID, NO_AUTH, IRR_MATCH, ROA_MATCH,
-                 NOT_ANNOUNCED, QUERY_FAILED]
+                 NOT_ANNOUNCED, QUERY_FAILED, IRR_SKIPPED]
 
 VERDICT_DESC = {
     ROA_MATCH: "ROA 覆盖且 origin 匹配（RFC 6811 valid）",
@@ -36,6 +38,7 @@ VERDICT_DESC = {
     NO_AUTH: "无 ROA 覆盖，IRR 也没有匹配的 route 对象",
     NOT_ANNOUNCED: "现网未广播，无 origin 可比对",
     QUERY_FAILED: "IRR 查询失败，无法判定",
+    IRR_SKIPPED: "无 ROA 覆盖，本次未查 IRR（--no-irr），无法判定",
 }
 MATCHED = {ROA_MATCH, IRR_MATCH}
 
@@ -117,7 +120,9 @@ def load_list(path):
     return rows
 
 
-def evaluate(rows, vrps, irr_results, irr_errors) -> list:
+def evaluate(rows, vrps, irr_results, irr_errors, irr_checked: bool = True) -> list:
+    """irr_checked=False（--no-irr）时，无 ROA 覆盖的前缀判 IRR-SKIPPED 而不是 NO-AUTH
+    —— 没查过 IRR 就说「无授权」，和把查询失败当成查无结果是同一个错误。"""
     out = []
     for net, origin in rows:
         routes = irr_results.get(net, [])
@@ -127,8 +132,6 @@ def evaluate(rows, vrps, irr_results, irr_errors) -> list:
             res = RovResult(net, None, roa_mod.NOTFOUND, [],
                             roa_mod.covering(net, vrps), routes, err,
                             NOT_ANNOUNCED)
-            res.roa_state = (roa_mod.VALID if res.roa_covering
-                             else roa_mod.NOTFOUND)
             # 未广播时 roa_state 只表示「有没有登记」，不代表校验结论
             res.roa_state = "registered" if res.roa_covering else "none"
             out.append(res)
@@ -141,6 +144,8 @@ def evaluate(rows, vrps, irr_results, irr_errors) -> list:
             res.verdict = ROA_MATCH
         elif state == roa_mod.INVALID:
             res.verdict = ROA_INVALID
+        elif not irr_checked:
+            res.verdict = IRR_SKIPPED
         elif err:
             res.verdict = QUERY_FAILED          # 无 ROA 覆盖又查不到 IRR，不能瞎判
         elif res.irr_matching:
