@@ -454,3 +454,50 @@ class TestRovReport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestGraphqlLimit(unittest.TestCase):
+    """GraphQL 返回条数到了上限要在 meta 里点名，报表据此提示可能被截断。"""
+
+    def _fake_urlopen(self, count):
+        import io
+        import json as _json
+        roa = {"ta": "apnic", "validFrom": 1, "validTo": 2, "state": "ADDED",
+               "asn": 65000, "roas": [{"prefix": "10.0.0.0/24", "maxLength": 24}]}
+        body = _json.dumps({"data": {"resource": [roa] * count}}).encode()
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return lambda *a, **k: Resp(body)
+
+    def _run(self, count):
+        from unittest import mock
+        vrps = [vrp("10.0.0.0/24", 65000, 24, expires=1000)]
+        meta = {}
+        with mock.patch.object(roa_mod.urllib.request, "urlopen", self._fake_urlopen(count)):
+            roa_mod.attach_validity(vrps, [net("10.0.0.0/24")], meta, url="http://x")
+        return meta
+
+    def test_full_page_is_flagged(self):
+        meta = self._run(roa_mod.GRAPHQL_LIMIT)
+        self.assertEqual(meta["expiry_truncated"], ["10.0.0.0/24"])
+
+    def test_partial_page_not_flagged(self):
+        meta = self._run(3)
+        self.assertNotIn("expiry_truncated", meta)
+        self.assertEqual(meta["expiry_kind"], roa_mod.EXPIRY_CERT)
+
+    def test_report_warns_when_truncated(self):
+        from ipmlib.rov_report import render as render_rov
+        from ipmlib.rov import evaluate
+        rows = [(net("10.0.0.0/24"), 65000)]
+        vrps = [vrp("10.0.0.0/24", 65000, 24, expires=1000)]
+        results = evaluate(rows, vrps, {}, {})
+        meta = {"expiry_kind": "cert", "expiry_truncated": ["10.0.0.0/16"]}
+        text = render_rov(results, meta, "whois.radb.net")
+        self.assertIn("1000 条上限", text)
+        self.assertIn("10.0.0.0/16", text)

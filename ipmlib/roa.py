@@ -33,6 +33,10 @@ CACHE_MAX_AGE = 0
 STALE_BUILDTIME = 2 * 3600
 CACHE_SCHEMA = 2                   # 缓存结构变了就作废重取
 
+# GraphQL 单次最多返回的 ROA 条数。返回条数到了上限说明结果可能被截断，
+# 被截掉的 VRP 会悄悄退回链路有效期，所以要在报表里点名。
+GRAPHQL_LIMIT = 1000
+
 # 到期时间的两种来源，含义完全不同，报表必须标明用的是哪一种
 EXPIRY_CERT = "cert"     # ROA 证书自身的 validTo（我们要的）
 EXPIRY_CHAIN = "chain"   # 整条验证链的有效期，受 manifest/CRL 约束，只有几天
@@ -188,7 +192,7 @@ def attach_validity(vrps, parents, meta, url: str = ROA_API_URL):
     报表会如实说明当次用的是哪种口径。
     """
     try:
-        validity = _fetch_validity(parents, url)
+        validity, truncated = _fetch_validity(parents, url)
     except Exception as exc:                       # 接口不可用不该让整个校验失败
         meta["expiry_source"] = f"{ROA_DUMP_URL}（验证链有效期，GraphQL 不可用：{exc}）"
         meta["expiry_kind"] = EXPIRY_CHAIN
@@ -211,16 +215,22 @@ def attach_validity(vrps, parents, meta, url: str = ROA_API_URL):
     meta["expiry_source"] = f"{url}（ROA 证书 validTo）"
     meta["expiry_kind"] = EXPIRY_CERT
     meta["expiry_hit"] = hit
+    if truncated:
+        meta["expiry_truncated"] = [str(p) for p in truncated]
     return out
 
 
-def _fetch_validity(parents, url: str) -> dict:
-    """按父前缀批量查 ROA 证书有效期，返回 {(网段, ASN, maxLength): (from, to)}。"""
-    query = ('{resource(type:ROA, limit:1000, prefixFilters:{prefix:"%s", '
-             'moreSpecific:true, lessSpecific:true, equal:true})'
-             '{ta validFrom validTo state ... on ROA{asn roas{prefix maxLength}}}}')
+def _fetch_validity(parents, url: str):
+    """按父前缀批量查 ROA 证书有效期。
 
-    out = {}
+    返回 ({(网段, ASN, maxLength): (from, to)}, [返回条数达到上限的父前缀])。
+    """
+    query = ('{resource(type:ROA, limit:%d, prefixFilters:{prefix:"%%s", '
+             'moreSpecific:true, lessSpecific:true, equal:true})'
+             '{ta validFrom validTo state ... on ROA{asn roas{prefix maxLength}}}}'
+             % GRAPHQL_LIMIT)
+
+    out, truncated = {}, []
     for parent in _aggregate(parents):
         payload = json.dumps({"query": query % parent}).encode()
         req = urllib.request.Request(
@@ -229,7 +239,10 @@ def _fetch_validity(parents, url: str) -> dict:
         with urllib.request.urlopen(req, timeout=45) as resp:
             data = json.loads(resp.read().decode())
 
-        for roa in (data.get("data", {}).get("resource") or []):
+        resources = data.get("data", {}).get("resource") or []
+        if len(resources) >= GRAPHQL_LIMIT:
+            truncated.append(parent)
+        for roa in resources:
             if roa.get("state") != "ADDED" or not roa.get("validTo"):
                 continue
             try:
@@ -247,7 +260,7 @@ def _fetch_validity(parents, url: str) -> dict:
                 prev = out.get(key)
                 if prev is None or vt > prev[1]:
                     out[key] = (vf, vt)
-    return out
+    return out, truncated
 
 
 def _aggregate(prefixes) -> list:

@@ -130,6 +130,10 @@ cache/              ROA VRP 缓存（.gitignore）
 .env                邮件凭证（.gitignore，600 权限）
 ```
 
+prod1 上 `running-config/`、`output/`、`cache/` 为 `700`、文件 `600`；`ipm-rov` /
+`ipm-scan` 两个服务以 `UMask=0077` 运行（drop-in 在 `ops` 仓库
+`hosts/prod1/systemd/`），新生成的报表和缓存同样只有 root 可读。
+
 `running-config/` 和 `output/` 不入库：前者含明文口令哈希、SNMP community 和客户
 电路信息，后者由前者生成、可随时重跑。因此新克隆的仓库里真实配置的回归测试会自动
 跳过（`TestRealConfigs` 检测不到 `running-config/` 就 skip），其余测试照常运行。
@@ -202,6 +206,8 @@ IRR 只认**精确前缀**的 route 对象（`-T route` 会把 less-specific 覆
 真正的 ROA 证书有效期来自 Cloudflare GraphQL 接口的 `validTo`（与其网页版
 Route Validator 同源），同一批 VRP 实际是 40~355 天。报表用 `validTo`，
 接口不可用时才退回链路有效期，**并在表头明确标注当次用的是哪种口径**。
+GraphQL 每次最多返回 1000 条 ROA（`GRAPHQL_LIMIT`），某个父网段返回条数达到上限时
+结果可能被截断，表头会点名这些网段 —— 被截掉的 VRP 会退回链路有效期。
 
 剩余天数向上取整：3 天后到期显示「剩 3 天」，向下取整会系统性少算一天。
 
@@ -288,6 +294,11 @@ BCC_EMAILS=
 
 密送地址只进投递列表、不写进信头 —— 写进去就不是密送了（有测试锁住这一点）。
 邮件发送失败时退出码为 `2` 且日志留有明确记录，但不会把校验结果本身判成失败。
+
+**运行失败也会发信。** 带 `--email` 时，若校验/扫描本身出错（ROA 下载失败、列表文件
+缺失、nmap 不可用等），先发一封 `[ipm] ROA/IRR 校验 ✗ 运行失败 — <错误>`（扫描为
+`IPv4 在用地址扫描 ✗ 运行失败`），正文附完整 traceback，然后照常以非零退出码结束，
+systemd 里仍记失败。否则收件人只会发现「今天没收到邮件」。
 
 
 ## 功能三：IPv4 在用地址扫描

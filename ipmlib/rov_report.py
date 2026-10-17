@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as _dt
 from collections import Counter
 
+from . import roa as roa_mod
 from .report import _pad, _rule, _trunc
 from .rov import (IRR_MATCH, MATCHED, NOT_ANNOUNCED, NO_AUTH, QUERY_FAILED,
                   ROA_INVALID, ROA_MATCH, VERDICT_DESC, VERDICT_ORDER)
@@ -146,6 +147,12 @@ def render(results, roa_meta, irr_server: str, width: int = 128) -> str:
         out.append("  ⚠ 本次没取到 ROA 证书的 validTo，到期列用的是 rpki.json 的")
         out.append("    验证链有效期（受 manifest/CRL 约束，通常只有几天），"
                    "不代表 ROA 真的快过期。")
+        out.append("")
+
+    if roa_meta.get("expiry_truncated"):
+        out.append(f"  ⚠ ROA 证书有效期查询在以下网段达到 {roa_mod.GRAPHQL_LIMIT} 条上限，可能被截断：")
+        out.append("    " + "、".join(roa_meta["expiry_truncated"]))
+        out.append("    被截掉的 ROA 到期列会退回验证链有效期（只有几天），不代表真的快过期。")
         out.append("")
 
     out.extend(_expiry_section(results, width))

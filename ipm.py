@@ -16,6 +16,7 @@ import csv
 import datetime
 import json
 import sys
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -447,7 +448,41 @@ def main(argv=None) -> int:
     sc.set_defaults(func=cmd_scan)
 
     args = ap.parse_args(argv)
-    return args.func(args)
+    if not getattr(args, "email", False):
+        return args.func(args)
+    try:
+        return args.func(args)
+    except (Exception, SystemExit) as exc:
+        if isinstance(exc, SystemExit) and exc.code in (0, None):
+            raise
+        # 定时任务出错时，原本只有 systemd 里一行失败记录，收件人只会发现
+        # 「今天没收到邮件」。先发一封失败通知，再照常抛出（退出码不变）。
+        _send_failure_email(args, exc)
+        raise
+
+
+FAILURE_TITLES = {"rov": "ROA/IRR 校验", "scan": "IPv4 在用地址扫描"}
+
+
+def _send_failure_email(args, exc) -> None:
+    title = FAILURE_TITLES.get(args.cmd, args.cmd)
+    if isinstance(exc, SystemExit):
+        brief = str(exc.code)
+        detail = brief
+    else:
+        brief = f"{type(exc).__name__}: {exc}"
+        detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    one_line = " ".join(brief.split())
+    subject = f"[ipm] {title} ✗ 运行失败 — {one_line[:80]}"
+    body = (f"ipm {args.cmd} 运行失败，本次没有生成报表。\n\n"
+            f"{detail}\n\n"
+            f"排查：journalctl -u ipm-{args.cmd} -n 50")
+    try:
+        cfg = mailer.MailConfig(mailer.load_env(args.env))
+        mailer.send(cfg, subject, body)
+        print(f"[ok] 失败通知已发送：{subject}", file=sys.stderr)
+    except Exception as mail_exc:
+        print(f"[error] 失败通知也发不出去：{mail_exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
